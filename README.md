@@ -569,9 +569,23 @@ x86-64 and arm64; anywhere else it stops and asks you to install Node manually.
 
 If you use SionnaRTStudio in research, cite the archived software release:
 
-> P. Tarafder, *SionnaRTStudio: A Browser-Based Wireless Digital Twin*,
-> version 1.0.0, Zenodo, 2026.
-> [doi:10.5281/zenodo.22064926](https://doi.org/10.5281/zenodo.22064926).
+> [1] P. Tarafder, *SionnaRTStudio: A Browser-Based Wireless Digital Twin*,
+> version 1.0.0. Zenodo, Aug. 23, 2026.
+> doi: [10.5281/zenodo.22064926](https://doi.org/10.5281/zenodo.22064926).
+
+
+```bibtex
+@misc{tarafder2026sionnartstudio,
+  author       = {Tarafder, Pulok},
+  title        = {{SionnaRTStudio}: A Browser-Based Wireless Digital Twin
+                  (v1.0.0)},
+  howpublished = {Zenodo},
+  month        = aug,
+  year         = {2026},
+  note         = {doi: 10.5281/zenodo.22064926},
+  url          = {https://doi.org/10.5281/zenodo.22064926}
+}
+```
 
 Machine-readable citation metadata is available in [`CITATION.cff`](CITATION.cff).
 
