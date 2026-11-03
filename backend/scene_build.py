@@ -13,10 +13,14 @@ ray-tracing bounce. That is reasonable for reflection and LOS occlusion, but the
 ``refraction`` toggle is an approximation for thick/solid structures — deep
 penetration is also bounded by ``max_depth``.
 """
+# Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+# Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import tempfile
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
@@ -26,6 +30,8 @@ import numpy as np
 import trimesh
 
 from .models import BuildingFootprint, MaterialConfig
+
+logger = logging.getLogger(__name__)
 
 SCENE_VERSION = "3.0.0"
 GROUND_MARGIN_M = 300.0  # how far the ground plane extends past the buildings
@@ -112,9 +118,7 @@ def _building_prism(footprint: BuildingFootprint) -> trimesh.Trimesh | None:
         # Loud on purpose: a silent failure here drops the building from the RT
         # scene, so rays pass through it (no occlusion). Most common cause is a
         # missing trimesh triangulation engine (see requirements: mapbox_earcut).
-        import sys
-        print(f"[scene_build] WARNING: failed to extrude building "
-              f"{footprint.id!r}: {exc}", file=sys.stderr)
+        logger.warning("Failed to extrude building %r: %s", footprint.id, exc)
         return None
 
 
@@ -221,8 +225,7 @@ def _apply_materials(scene, materials: list[MaterialConfig]) -> None:
                 if cfg.thickness is not None:
                     rm.thickness = float(cfg.thickness)
             except Exception as exc:
-                print(f"[scene_build] WARNING: failed to apply material "
-                      f"{target_id!r}: {exc}", file=sys.stderr)
+                logger.warning("Failed to apply radio material %r: %s", target_id, exc)
 
 
 def _write_scene_xml(

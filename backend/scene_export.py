@@ -15,6 +15,9 @@ The generated script preserves each transmitter's configured ``power_dbm``.
 Sionna's CIR/CFR coefficients are independent of transmit power, but retaining
 it makes later RSS and radio-map calculations faithful to the studio project.
 """
+# Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+# Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 from __future__ import annotations
 
 import io
@@ -214,7 +217,9 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         "groups because Sionna has one scene-wide Tx array and one Rx array.",
         "Requires sionna-rt; a CUDA Mitsuba variant gives GPU tracing.",
         '"""',
+        "import logging",
         "import numpy as np",
+        "logging.basicConfig(level=logging.INFO)",
         "from pathlib import Path",
         "",
         "from sionna.rt import (",
@@ -329,7 +334,7 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         "        tx_array_size=np.asarray(group['txArraySize']),",
         "        rx_array_size=np.asarray(group['rxArraySize']),",
         "    )",
-        "    print(f\"{group['file']}: a={a.shape}, tau={tau.shape}, h={h.shape}\")",
+        "    logging.info(\"%s: a=%s tau=%s h=%s\", group['file'], a.shape, tau.shape, h.shape)",
         "    return paths",
         "",
         "",
@@ -347,7 +352,7 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         f"{opts.rxPattern!r}, {opts.rxPolarization!r})",
         "    _clear_devices()",
         "    _add_devices(range(len(TX_SPECS)), range(len(RX_SPECS)))",
-        '    print("No CIR/CFR generated: at least one Tx and one Rx are required.")',
+        '    logging.warning("No CIR/CFR was generated because at least one transmitter and one receiver are required.")',
         "",
     ]
     return "\n".join(body)

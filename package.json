@@ -1,5 +1,6 @@
 {
-  "name": "sionna-rt-studio",
+  "x-fork-modification-notice": "Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.",
+"name": "sionna-rt-studio",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -12,7 +13,13 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "check:osm-parser": "node --import tsx scripts/check-osm-parser.ts",
-    "freeze:osm-scene": "node --import tsx scripts/freeze-osm-scene.ts"
+    "freeze:osm-scene": "node --import tsx scripts/freeze-osm-scene.ts",
+    "check:preview-lod": "node --import tsx scripts/check-preview-lod.mjs",
+    "check:base-station-import": "node --import tsx scripts/check-base-station-import.ts",
+    "check:georeference": "node --import tsx scripts/check-georeference.ts",
+    "check:link-matrix-persistence": "node --import tsx scripts/check-link-matrix-persistence.ts",
+    "check:measurement-overlay": "node --import tsx scripts/check-measurement-overlay.ts",
+    "check:panel-lifecycle": "node scripts/check-panel-lifecycle.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",

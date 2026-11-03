@@ -1,3 +1,6 @@
+MODIFICATION NOTICE: This file has been modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 SionnaRTStudio
 Copyright 2026 Pulok Tarafder
 
@@ -8,3 +11,11 @@ NVIDIA Sionna RT is licensed under the Apache License, Version 2.0.
 OpenStreetMap data is copyright OpenStreetMap contributors and is available
 under the Open Database License. Other dependencies retain their respective
 licenses and notices.
+
+Fork provenance
+----------------
+Fork repository: https://github.com/alexandarM/SionnaRTStudio
+This repository is a modified fork of SionnaRTStudio by Pulok Tarafder.
+Upstream repository: https://github.com/puloktarafder/SionnaRTStudio
+Fork-specific additions and documentation are described in FORK_AND_ATTRIBUTION.md.
+The original upstream copyright and third-party notices above are retained.

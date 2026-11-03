@@ -1,3 +1,6 @@
+// Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+// Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -39,6 +42,8 @@ interface TrajectoryPanelProps {
   mobilityHandover: HandoverAnalysis | null;
   solveError: string;
   backendOnline: boolean;
+  /** Whether this preserved panel is currently visible. Playback pauses when hidden. */
+  active: boolean;
 }
 
 // 3GPP TS 38.331 timeToTrigger values (ms), abbreviated to the common ones.
@@ -74,6 +79,7 @@ export function TrajectoryPanel({
   mobilityHandover,
   solveError,
   backendOnline,
+  active,
 }: TrajectoryPanelProps) {
   const [isSimulatingMobility, setIsSimulatingMobility] = useState(false);
   const [mobilityStep, setMobilityStep] = useState(0);
@@ -114,6 +120,13 @@ export function TrajectoryPanel({
     }
     setIsSimulatingMobility(false);
   };
+
+  // This panel remains mounted when the user switches Studio modes so its
+  // controls/results survive. Playback itself is intentionally stopped while
+  // hidden, matching the old unmount-cleanup behavior without discarding state.
+  useEffect(() => {
+    if (!active) stopMobilityPlayback();
+  }, [active]);
 
   // Generate a standard loop trajectory around the TX node automatically.
   const generateCircularTrajectory = () => {

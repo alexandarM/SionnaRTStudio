@@ -1,3 +1,6 @@
+// Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+// Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 import { HandoverConfig } from './api';
 import { ColormapName } from './lib/colormaps';
 import {
@@ -15,7 +18,7 @@ import {
 export const PROJECT_SCHEMA_VERSION = 1;
 export const PROJECT_STORAGE_KEY = 'sionna-rt-studio.project.v1';
 
-export type StudioNavTab = '3d_scene' | 'geography' | 'analysis' | 'export';
+export type StudioNavTab = '3d_scene' | 'geography' | 'analysis' | 'field_validation' | 'experiments' | 'export';
 export type StudioMode = 'link' | 'heatmap' | 'playback';
 
 export interface StudioProjectState {
@@ -209,7 +212,7 @@ const isProjectState = (value: unknown): value is StudioProjectState => {
     isFiniteNumber(mobility.handover.timeToTriggerMs) &&
     isFiniteNumber(mobility.speedKmh) &&
     isFiniteNumber(mobility.intervalMs) &&
-    ['3d_scene', 'geography', 'analysis', 'export'].includes(String(display.activeNavTab)) &&
+    ['3d_scene', 'geography', 'analysis', 'field_validation', 'experiments', 'export'].includes(String(display.activeNavTab)) &&
     ['link', 'heatmap', 'playback'].includes(String(display.activeMode)) &&
     typeof display.showOutlines === 'boolean' &&
     typeof display.showRaysOnHeatmap === 'boolean' &&

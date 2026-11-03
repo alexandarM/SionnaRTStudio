@@ -1,3 +1,6 @@
+// Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+// Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 /**
  * Freeze one production-equivalent OpenStreetMap scene for experiments.
  *
@@ -80,8 +83,24 @@ async function main(): Promise<void> {
         failures.push(`${candidate}: ${response.status} ${response.statusText}`);
         continue;
       }
+      const responseText = await response.text();
+      let parsed: OverpassData & { remark?: string };
+      try {
+        parsed = JSON.parse(responseText) as OverpassData & { remark?: string };
+      } catch {
+        failures.push(`${candidate}: response was not valid JSON`);
+        continue;
+      }
+      if (parsed.remark) {
+        failures.push(`${candidate}: ${parsed.remark}`);
+        continue;
+      }
+      if (!Array.isArray(parsed.elements)) {
+        failures.push(`${candidate}: response did not contain an elements array`);
+        continue;
+      }
       endpoint = candidate;
-      rawResponse = await response.text();
+      rawResponse = responseText;
       break;
     } catch (error) {
       failures.push(`${candidate}: ${error instanceof Error ? error.message : String(error)}`);

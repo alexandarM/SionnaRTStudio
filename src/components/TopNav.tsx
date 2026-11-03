@@ -1,3 +1,6 @@
+// Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+// Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -9,12 +12,14 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from
 // remapped onto the theme's warm range. The original file is untouched.
 const LOGO_URL = new URL('../../assets/logo-app-bone.png', import.meta.url).href;
 
-export type NavTab = '3d_scene' | 'geography' | 'analysis' | 'export';
+export type NavTab = '3d_scene' | 'geography' | 'analysis' | 'field_validation' | 'experiments' | 'export';
 
 const TABS: ReadonlyArray<readonly [string, NavTab]> = [
   ['3D scene', '3d_scene'],
   ['Geography', 'geography'],
   ['Analysis', 'analysis'],
+  ['Field Validation', 'field_validation'],
+  ['Experiments', 'experiments'],
   ['Export', 'export'],
 ] as const;
 

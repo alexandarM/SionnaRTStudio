@@ -15,6 +15,9 @@ Both logo assets are processed with identical parameters so they match.
 Usage:
     python scripts/recolor-logo.py <source>.png assets/logo-app-bone.png
 """
+# Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+# Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 from __future__ import annotations
 
 import sys
@@ -84,7 +87,6 @@ def recolor(src_path: str, dst_path: str) -> None:
     if not has_alpha:
         image = image.convert("RGB")
     image.save(dst_path)
-    print(f"{src_path} -> {dst_path}  ({image.mode}, {image.size[0]}x{image.size[1]})")
 
 
 if __name__ == "__main__":

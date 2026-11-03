@@ -1,3 +1,6 @@
+// Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+// Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -5,7 +8,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { BookOpen } from 'lucide-react';
-import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, defaultMaterialConfig } from './types';
+import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, defaultMaterialConfig, MeasurementOverlayPoint } from './types';
 import { ColormapName } from './lib/colormaps';
 import { ThreeStudio } from './components/ThreeStudio';
 import { TopNav } from './components/TopNav';
@@ -17,12 +20,17 @@ import { TrajectoryPanel } from './components/TrajectoryPanel';
 import { GeographyPanel } from './components/GeographyPanel';
 import { AnalysisPanel } from './components/AnalysisPanel';
 import { ExportPanel } from './components/ExportPanel';
+import { FieldValidationPanel } from './components/FieldValidationPanel';
+import { ExperimentPanel } from './components/ExperimentPanel';
+import { BaseStationImportPanel } from './components/BaseStationImportPanel';
 import {
   latLonToENU,
   enuToLatLon,
   fetchOSMBuildings,
 } from './utils';
-import { solveLink, solveRadioMap, solveMobility, checkBackend, MobilityExecution, MobilityStep, HandoverAnalysis, HandoverConfig } from './api';
+import { createSolveContextKey, enuPositionChanged } from './lib/solveContext';
+import { solveLink, solveRadioMap, solveMobility, checkBackend, MobilityExecution, MobilityStep, HandoverAnalysis, HandoverConfig, ExperimentRun, createExperimentRecord, getPhyBerStatus, getMeasurementRayTraceJob } from './api';
+import { safeCreateExperiment, safeUpdateExperiment, sha256Json, summarizeUnknownExperimentResult, summarizeMeasurementRayTrace } from './lib/experimentLogging';
 import {
   clearAutosavedProject,
   loadAutosavedProject,
@@ -225,6 +233,19 @@ export default function App() {
   const [freqGhz, setFreqGhz] = useState(
     () => AUTOSAVED_PROJECT?.solver.carrierFrequencyGhz ?? 28.0,
   ); // Default to mmWave
+  // Imported inventory can span multiple RAT/bands. RadioMapSolver uses one
+  // scene carrier frequency, so cross-band transmitters must never be solved as
+  // if they interfered on the same carrier.
+  const [coverageBandFilter, setCoverageBandFilter] = useState('__all__');
+  const [confirmedCarrierBand, setConfirmedCarrierBand] = useState<string | null>(null);
+  const coverageBandOptions = React.useMemo(
+    () => Array.from(new Set(txs.map((item) => item.frequencyBand).filter((band): band is string => Boolean(band)))).sort(),
+    [txs],
+  );
+  const coverageTxs = React.useMemo(() => {
+    if (coverageBandFilter === '__all__') return txs;
+    return txs.filter((item) => item.frequencyBand === coverageBandFilter);
+  }, [txs, coverageBandFilter]);
   const [maxDepth, setMaxDepth] = useState(
     () => AUTOSAVED_PROJECT?.solver.maxDepth ?? 3,
   ); // Sionna RT max interaction depth
@@ -249,9 +270,26 @@ export default function App() {
   );
 
   // Top navigation view (3D SCENE / GEOGRAPHY / ANALYSIS / EXPORT)
-  const [activeNavTab, setActiveNavTab] = useState<'3d_scene' | 'geography' | 'analysis' | 'export'>(
+  const [activeNavTab, setActiveNavTab] = useState<'3d_scene' | 'geography' | 'analysis' | 'field_validation' | 'experiments' | 'export'>(
     () => AUTOSAVED_PROJECT?.display.activeNavTab ?? '3d_scene',
   );
+
+  // Georeferenced field measurements are lifted to App state so they remain
+  // visible when navigating from Field Validation back to the 3D scene.
+  const [measurementOverlayPoints, setMeasurementOverlayPoints] = useState<MeasurementOverlayPoint[]>([]);
+  const [measurementOverlayLabel, setMeasurementOverlayLabel] = useState('');
+  const [measurementOverlayVisible, setMeasurementOverlayVisible] = useState(true);
+  const showMeasurementOverlayIn3D = (points: MeasurementOverlayPoint[], label: string) => {
+    setMeasurementOverlayPoints(points);
+    setMeasurementOverlayLabel(label);
+    setMeasurementOverlayVisible(true);
+    setActiveNavTab('3d_scene');
+  };
+  const clearMeasurementOverlay = () => {
+    setMeasurementOverlayPoints([]);
+    setMeasurementOverlayLabel('');
+    setMeasurementOverlayVisible(false);
+  };
 
   // Active Studio Modes
   const [activeMode, setActiveMode] = useState<'link' | 'heatmap' | 'playback'>(
@@ -267,11 +305,23 @@ export default function App() {
 
   // Coverage Map State
   const [radioMap, setRadioMap] = useState<RadioMapGrid | null>(null);
+  const [focusedRadioMapCellIndex, setFocusedRadioMapCellIndex] = useState<number | null>(null);
+  useEffect(() => {
+    setFocusedRadioMapCellIndex(null);
+  }, [radioMap?.mapId]);
   const [loadingHeatmap, setLoadingHeatmap] = useState(false);
   // Interference-aware coverage controls (Sionna RadioMapSolver rss/sinr).
   const [coverageMetric, setCoverageMetric] = useState<CoverageMetric>(
     () => AUTOSAVED_PROJECT?.coverage.metric ?? 'power',
   );
+  const [coverageThresholdDb, setCoverageThresholdDb] = useState(-90);
+  const handleCoverageMetricChange = (metric: CoverageMetric) => {
+    setCoverageMetric(metric);
+    const defaults: Record<CoverageMetric, number> = {
+      power: -90, path_gain: -110, path_loss: 110, sinr: 0, best_sinr: 0, interference: -100, sir: 0, inr: -10, dominance: 6,
+    };
+    setCoverageThresholdDb(defaults[metric]);
+  };
   const [coverageBandwidthMhz, setCoverageBandwidthMhz] = useState(
     () => AUTOSAVED_PROJECT?.coverage.bandwidthMhz ?? 100,
   );
@@ -316,16 +366,39 @@ export default function App() {
   >(() => AUTOSAVED_PROJECT?.mobility.trajectoryPoints ?? []);
   const [activeMobilityStep, setActiveMobilityStep] = useState<MobilityStep | null>(null);
 
-  // Synchronize active Transmitter Lat/Lon ↔ ENU
+  // Synchronize active Transmitter Lat/Lon ↔ ENU. Changing the active device
+  // (including clicking a cell in the solved Tx × Rx matrix) is a selection
+  // operation, not a geometry edit. Skip the conversion on selection changes;
+  // device-edit handlers already keep the geographic and ENU coordinates in
+  // sync. The epsilon guard also avoids invalidation from round-trip noise.
+  const previousTxSelectionRef = useRef(activeTxId);
   useEffect(() => {
+    const selectionChanged = previousTxSelectionRef.current !== activeTxId;
+    previousTxSelectionRef.current = activeTxId;
+    if (selectionChanged) return;
+
     const enu = latLonToENU(tx.latitude, tx.longitude, anchor);
-    setTxs((prev) => prev.map((t) => (t.id === activeTxId ? { ...t, enu } : t)));
+    setTxs((prev) => {
+      const current = prev.find((item) => item.id === activeTxId);
+      if (!current || !enuPositionChanged(current.enu, enu)) return prev;
+      return prev.map((item) => (item.id === activeTxId ? { ...item, enu } : item));
+    });
   }, [tx.latitude, tx.longitude, anchor, activeTxId]);
 
-  // Synchronize active Receiver Lat/Lon ↔ ENU
+  // Same rule for receivers: selecting another RX must not mutate device
+  // geometry and consequently clear previously solved all-pairs results.
+  const previousRxSelectionRef = useRef(activeRxId);
   useEffect(() => {
+    const selectionChanged = previousRxSelectionRef.current !== activeRxId;
+    previousRxSelectionRef.current = activeRxId;
+    if (selectionChanged) return;
+
     const enu = latLonToENU(rx.latitude, rx.longitude, anchor);
-    setRxs((prev) => prev.map((r) => (r.id === activeRxId ? { ...r, enu } : r)));
+    setRxs((prev) => {
+      const current = prev.find((item) => item.id === activeRxId);
+      if (!current || !enuPositionChanged(current.enu, enu)) return prev;
+      return prev.map((item) => (item.id === activeRxId ? { ...item, enu } : item));
+    });
   }, [rx.latitude, rx.longitude, anchor, activeRxId]);
 
   // PROPAGATION LINK PHYSICS SOLVER — real Sionna RT on the backend, run on demand.
@@ -357,6 +430,24 @@ export default function App() {
   // so a fresh single-link solve isn't drowned out by every pair's rays.
   const [matrixRaysVisible, setMatrixRaysVisible] = useState(false);
 
+  const [sceneGeometryFingerprint, setSceneGeometryFingerprint] = useState('');
+  useEffect(() => {
+    let active = true;
+    void sha256Json({ anchor, buildings }).then((fingerprint) => {
+      if (active) setSceneGeometryFingerprint(fingerprint);
+    }).catch(() => { if (active) setSceneGeometryFingerprint(''); });
+    return () => { active = false; };
+  }, [anchor, buildings]);
+
+  // Invalidate cached solve outputs only when physical solve inputs change.
+  // The selected TX/RX IDs are deliberately NOT dependencies: selecting a
+  // solved matrix cell must retain the matrix and simply focus its link paths.
+  // A canonical key also protects against harmless React object identity changes.
+  const solveContextKey = React.useMemo(
+    () => createSolveContextKey({ buildings, txs, rxs, freqGhz, maxDepth, solverOptions, materialConfigs }),
+    [buildings, txs, rxs, freqGhz, maxDepth, solverOptions, materialConfigs],
+  );
+
   useEffect(() => {
     setPaths([]);
     setMetrics(EMPTY_METRICS);
@@ -364,22 +455,16 @@ export default function App() {
     setRadioMap(null);
     setMobilitySteps([]);
     setActiveMobilityStep(null);
-  }, [
-    buildings,
-    activeTxId,
-    activeRxId,
-    // Every device edit (position, power, antenna, beam — active or not) flows
-    // through setTxs/setRxs, so the two arrays cover all device-driven staleness.
-    // Mobility ray-traces every Tx and the radio map uses every Tx.
-    txs,
-    rxs,
-    freqGhz,
-    maxDepth,
-    solverOptions,
-    materialConfigs,
-  ]);
+  }, [solveContextKey]);
 
   const handleSolve = async () => {
+    const startedAtUtc = new Date().toISOString();
+    const started = performance.now();
+    const requestBody = { tx, rx, buildings, freqGhz, maxDepth, options: solverOptions, materials: materialList };
+    const configuration = { tx, rx, freqGhz, maxDepth, solverOptions, materials: materialList, scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } };
+    let status: 'done' | 'error' = 'done';
+    let resultSummary: Record<string, unknown> = {};
+    let errorText: string | null = null;
     setSolving(true);
     setSolveError('');
     try {
@@ -388,21 +473,36 @@ export default function App() {
       setMetrics(res.metrics);
       setMatrixRaysVisible(false); // focus the 3D scene on this single link
       setBackendOnline(true);
+      resultSummary = summarizeUnknownExperimentResult('link_solve', res);
     } catch (e: any) {
-      setSolveError(e?.message || 'Solve failed');
+      status = 'error';
+      errorText = e?.message || 'Solve failed';
+      setSolveError(errorText);
       checkBackend().then(setBackendOnline); // a solve error != backend offline
     } finally {
       setSolving(false);
+      await safeCreateExperiment({
+        name: `Link solve · ${tx.name} → ${rx.name}`, kind: 'link_solve', status,
+        startedAtUtc, completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
+        seed: solverOptions.pathSeed, configuration,
+        parameters: { txId: tx.id, rxId: rx.id, freqGhz, maxDepth, pathSamplesPerSource: solverOptions.pathSamplesPerSource, seed: solverOptions.pathSeed, buildingCount: buildings.length },
+        results: resultSummary, error: errorText,
+        replay: { endpoint: '/api/solve', body: requestBody, description: 'Repeat the exact single-link PathSolver request' },
+      });
     }
   };
 
   // Solve every Tx → Rx pair (serial GPU ray traces, scene is cached).
   const handleSolveMatrix = async () => {
-    setMatrixLoading(true);
-    setSolveError('');
+    const startedAtUtc = new Date().toISOString();
+    const started = performance.now();
     const next: Record<string, MatrixCell> = {};
     const total = txs.length * rxs.length;
     let done = 0;
+    let status: 'done' | 'error' = 'done';
+    let errorText: string | null = null;
+    setMatrixLoading(true);
+    setSolveError('');
     try {
       for (const t of txs) {
         for (const r of rxs) {
@@ -415,17 +515,25 @@ export default function App() {
       setMatrix(next);
       setMatrixRaysVisible(true); // show every pair's rays until a pair is focused
       const act = next[`${activeTxId}|${activeRxId}`];
-      if (act) {
-        setPaths(act.paths);
-        setMetrics(act.metrics);
-      }
+      if (act) { setPaths(act.paths); setMetrics(act.metrics); }
       setBackendOnline(true);
     } catch (e: any) {
-      setSolveError(e?.message || 'Matrix solve failed');
+      status = 'error'; errorText = e?.message || 'Matrix solve failed';
+      setSolveError(errorText);
       checkBackend().then(setBackendOnline);
     } finally {
       setMatrixLoading(false);
       setMatrixProgress('');
+      const pairSummaries = Object.values(next).map((cell) => ({ txId: cell.txId, rxId: cell.rxId, pathCount: cell.paths.length, metrics: cell.metrics }));
+      await safeCreateExperiment({
+        name: `All-pairs link matrix · ${txs.length} TX × ${rxs.length} RX`, kind: 'link_matrix', status,
+        startedAtUtc, completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
+        seed: solverOptions.pathSeed,
+        configuration: { txs, rxs, freqGhz, maxDepth, solverOptions, materials: materialList, scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } },
+        parameters: { txCount: txs.length, rxCount: rxs.length, totalPairs: total, solvedPairs: Object.keys(next).length, freqGhz, maxDepth, pathSamplesPerSource: solverOptions.pathSamplesPerSource, seed: solverOptions.pathSeed },
+        results: { solvedPairs: pairSummaries }, error: errorText,
+        replay: { endpoint: '/api/solve', body: { kind: 'link_matrix', txs, rxs, buildings, freqGhz, maxDepth, options: solverOptions, materials: materialList }, description: 'Repeat every transmitter–receiver pair in the link matrix' },
+      });
     }
   };
 
@@ -436,7 +544,26 @@ export default function App() {
     [matrix, matrixRaysVisible],
   );
 
+  // Device-list selection keeps the all-pairs matrix intact. If that selected
+  // pair has already been solved, reuse its cached result; otherwise clear only
+  // the focused single-link readout (not the matrix itself).
+  const handleSelectTx = (txId: string) => {
+    setActiveTxId(txId);
+    const cell = matrix[`${txId}|${activeRxId}`];
+    setPaths(cell?.paths ?? []);
+    setMetrics(cell?.metrics ?? EMPTY_METRICS);
+    setMatrixRaysVisible(false);
+  };
+  const handleSelectRx = (rxId: string) => {
+    setActiveRxId(rxId);
+    const cell = matrix[`${activeTxId}|${rxId}`];
+    setPaths(cell?.paths ?? []);
+    setMetrics(cell?.metrics ?? EMPTY_METRICS);
+    setMatrixRaysVisible(false);
+  };
+
   // Selecting a matrix cell focuses that Tx→Rx pair and shows its multipath.
+  // The matrix remains a reusable cache until a physical solve input changes.
   const handleSelectPair = (txId: string, rxId: string) => {
     setActiveTxId(txId);
     setActiveRxId(rxId);
@@ -487,6 +614,43 @@ export default function App() {
     );
   };
 
+  const handleImportBaseStations = (imported: Transmitter[], replaceExisting: boolean) => {
+    // Re-importing the same spreadsheet in append mode must not create duplicate
+    // React keys or collide with existing transmitter identities.
+    const usedIds = new Set(replaceExisting ? [] : txs.map((item) => item.id));
+    const uniqueImported = imported.map((item) => {
+      const baseId = item.id;
+      let id = baseId;
+      let suffix = 2;
+      while (usedIds.has(id)) id = `${baseId}_${suffix++}`;
+      usedIds.add(id);
+      return id === item.id ? item : { ...item, id };
+    });
+    const next = replaceExisting ? uniqueImported : [...txs, ...uniqueImported];
+    setTxs(next);
+    if (uniqueImported.length) setActiveTxId(uniqueImported[0].id);
+    const importedBands = Array.from(new Set(uniqueImported.map((item) => item.frequencyBand).filter((band): band is string => Boolean(band))));
+    setCoverageBandFilter(importedBands.length === 1 ? importedBands[0] : '__all__');
+    setConfirmedCarrierBand(null);
+    setRadioMap(null);
+    setPaths([]);
+    setSolveError('');
+    setActiveNavTab('3d_scene');
+  };
+
+  const handleCoverageBandSelect = (band: string) => {
+    setCoverageBandFilter(band);
+    setConfirmedCarrierBand(null);
+    setRadioMap(null);
+  };
+
+  const handleSetFreqGhz = (value: number) => {
+    setFreqGhz(value);
+    // If exact carrier metadata is absent, a manual RF-control edit after
+    // selecting the band is an explicit user confirmation of the channel.
+    setConfirmedCarrierBand(coverageBandFilter);
+  };
+
   const handleRxUpdate = (updatedRx: Receiver) => {
     const latLon = enuToLatLon(updatedRx.enu, anchor);
     setRxs((prev) =>
@@ -494,10 +658,13 @@ export default function App() {
     );
   };
 
-  // OVERPASS GIS DOWNLOAD PIPELINE
+  // OVERPASS GIS DOWNLOAD PIPELINE. `buildings` is the authoritative OSM feature
+  // dataset used by the backend/Sionna scene. ThreeStudio derives disposable,
+  // batched preview BufferGeometry from it; renderer LOD/batching never edits or
+  // substitutes the source footprints sent to the physical solver.
   const handleDownloadOSM = async (bounds: L.LatLngBounds) => {
     setGisLoading(true);
-    setDownloadProgress('Sending bounding query to Overpass server...');
+    setDownloadProgress('Sending OSM tile request through the SionnaRTStudio backend proxy...');
     try {
       const south = bounds.getSouth();
       const west = bounds.getWest();
@@ -514,16 +681,16 @@ export default function App() {
 
       if (loadedBuildings.length === 0) {
         setDownloadProgress('No buildings found in this bounding extent, keeping preloaded coordinates.');
-        setTimeout(() => setGisLoading(false), 2000);
         return;
       }
 
       setBuildings(loadedBuildings);
       setDownloadProgress(`Twin mapped successfully! Mapped ${loadedBuildings.length} active structures.`);
-      setTimeout(() => setGisLoading(false), 1500);
     } catch (e: any) {
       setDownloadProgress(`Fetch failed: ${e.message || 'Check connections'}`);
-      setTimeout(() => setGisLoading(false), 3000);
+    } finally {
+      // Do not leave Fetch/Reset disabled if a request fails or returns early.
+      setGisLoading(false);
     }
   };
 
@@ -732,6 +899,13 @@ export default function App() {
       setSolveError('Draw at least two mobility waypoints in the 3D scene.');
       return;
     }
+    const startedAtUtc = new Date().toISOString();
+    const started = performance.now();
+    let status: 'done' | 'error' = 'done';
+    let resultSummary: Record<string, unknown> = {};
+    let errorText: string | null = null;
+    let replayBody: Record<string, unknown> = {};
+    let waypointCount = 0;
     setMobilityLoading(true);
     setSolveError('');
     try {
@@ -742,6 +916,8 @@ export default function App() {
       const sampledPath = sampleMobilityPath(intervalMs, speedKmh);
       setTrajectoryPoints(sampledPath);
       const waypoints = sampledPath.map((p) => ({ x: p.enu.x, y: p.enu.y, z: p.enu.z }));
+      waypointCount = waypoints.length;
+      replayBody = { txs, rx, buildings, waypoints, freqGhz, speedKmh, maxDepth, options: solverOptions, materials: materialList, combineMode: mobilityCombineMode, executionMode: 'auto', handover: handoverConfig };
 
       // One API request preserves the backend's one-PathSolver-dispatch fast
       // path over all Tx × waypoints and makes the browser workflow identical
@@ -755,19 +931,27 @@ export default function App() {
       const all = res.steps.map((step, index) => ({ ...step, index }));
       setMobilityExecution(res.execution);
       setMobilityHandover(res.handover ?? null);
-
       setMobilitySteps(all);
-      if (all[0]) {
-        handleMobilityStepSelect(all[0]);
-      }
+      if (all[0]) handleMobilityStepSelect(all[0]);
+      resultSummary = summarizeUnknownExperimentResult('mobility', res);
       setBackendOnline(true);
     } catch (err: any) {
       console.error(err);
-      setSolveError(err?.message || 'Mobility solve failed');
+      status = 'error'; errorText = err?.message || 'Mobility solve failed';
+      setSolveError(errorText);
       checkBackend().then(setBackendOnline);
     } finally {
       setMobilityLoading(false);
       setMobilityProgress('');
+      await safeCreateExperiment({
+        name: `Mobility · ${txs.length} TX · ${waypointCount || trajectoryPoints.length} waypoints`, kind: 'mobility', status,
+        startedAtUtc, completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
+        seed: solverOptions.pathSeed,
+        configuration: { txs, rx, freqGhz, maxDepth, solverOptions, materials: materialList, mobilityCombineMode, handoverConfig, scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } },
+        parameters: { speedKmh, intervalMs, waypointCount, txCount: txs.length, combineMode: mobilityCombineMode, handover: handoverConfig, seed: solverOptions.pathSeed },
+        results: resultSummary, error: errorText,
+        replay: status === 'done' ? { endpoint: '/api/mobility', body: replayBody, description: 'Repeat mobility path simulation' } : { endpoint: '/api/mobility', body: replayBody, description: 'Retry failed mobility path simulation' },
+      });
     }
   };
 
@@ -780,26 +964,217 @@ export default function App() {
 
   // COVERAGE HEATMAP — real Sionna RadioMapSolver, best-server across all Tx.
   const handleRunHeatmap = async (resolution: number, height: number, samplesPerTx: number, seed: number) => {
+    if (coverageBandOptions.length > 1 && coverageBandFilter === '__all__') {
+      setSolveError('Multiple frequency-band groups were imported. Select one Frequency Band group before computing a radio map; different bands must not be treated as co-channel interferers.');
+      return;
+    }
+    const selectedTransmitters = coverageBandFilter !== '__all__' ? coverageTxs : txs;
+    const mixedClassifiedAndUnclassified = selectedTransmitters.some((item) => !item.frequencyBand)
+      && selectedTransmitters.some((item) => Boolean(item.frequencyBand));
+    if (mixedClassifiedAndUnclassified) {
+      setSolveError('The selected group contains transmitters both with and without Frequency Band metadata. Remove unclassified transmitters or re-import the table using Replace current transmitters.');
+      return;
+    }
+    if (!selectedTransmitters.length) {
+      setSolveError('The selected Frequency Band group contains no transmitters.');
+      return;
+    }
+    const knownCarriers: number[] = Array.from(new Set<number>(selectedTransmitters
+      .map((item) => item.carrierFrequencyGhz)
+      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))));
+    if (knownCarriers.length > 1) {
+      setSolveError(`The selected group contains multiple exact carrier frequencies (${knownCarriers.join(', ')} GHz). Separate them before running RadioMapSolver.`);
+      return;
+    }
+    if (knownCarriers.length === 1 && Math.abs(knownCarriers[0] - freqGhz) > 0.001) {
+      setSolveError(`The RF controls are set to ${freqGhz} GHz, but the imported table lists ${knownCarriers[0]} GHz for the selected group. Align the carrier frequency before running the calculation.`);
+      return;
+    }
+    const hasImportedBandWithoutExactCarrier = selectedTransmitters.some(
+      (item) => Boolean(item.frequencyBand) && !Number.isFinite(item.carrierFrequencyGhz),
+    );
+    const selectedBandKey = coverageBandFilter !== '__all__' ? coverageBandFilter : '__all__';
+    if (hasImportedBandWithoutExactCarrier && confirmedCarrierBand !== selectedBandKey) {
+      setSolveError('The table contains a Frequency Band label but no exact carrier frequency. Select a band group, enter the deployed downlink carrier in RF Controls, and only then run the radio map. Labels such as n78, GSM 900, or 791/2110 MHz are not sufficient to determine the channel.');
+      return;
+    }
+    const startedAtUtc = new Date().toISOString();
+    const started = performance.now();
+    const coverageRequest = { metric: coverageMetric, coverageThresholdDb, rssCoverageThresholdDb: -100, sinrCoverageThresholdDb: 0, bandwidthHz: coverageBandwidthMhz * 1e6, noiseFigureDb: coverageNoiseFigureDb, samplesPerTx, seed };
+    const replayBody = { txs: selectedTransmitters, buildings, freqGhz, gridSize: resolution, gridHeight: height, maxDepth, options: solverOptions, materials: materialList, ...coverageRequest };
+    let status: 'done' | 'error' = 'done';
+    let resultSummary: Record<string, unknown> = {};
+    let errorText: string | null = null;
     setLoadingHeatmap(true);
+    setSolveError('');
     try {
       const grid = await solveRadioMap(
-        txs, buildings, freqGhz, resolution, height, maxDepth, solverOptions, materialList,
-        {
-          metric: coverageMetric,
-          bandwidthHz: coverageBandwidthMhz * 1e6,
-          noiseFigureDb: coverageNoiseFigureDb,
-          samplesPerTx,
-          seed,
-        },
+        selectedTransmitters, buildings, freqGhz, resolution, height, maxDepth, solverOptions, materialList,
+        coverageRequest,
       );
-      setRadioMap(grid);
+      setRadioMap({
+        ...grid,
+        geoReference: {
+          crs: 'EPSG:4326',
+          anchor: { ...anchor },
+          method: 'WGS84_LOCAL_TANGENT_ENU',
+          note: 'Local WGS84 tangent-plane ENU conversion; accuracy depends on the scene anchor and is intended for local-area scenes.',
+        },
+      });
+      resultSummary = summarizeUnknownExperimentResult('radio_map', grid);
       setBackendOnline(true);
     } catch (err: any) {
       console.error(err);
-      setSolveError(err?.message || 'Radio map failed');
+      status = 'error'; errorText = err?.message || 'Radio map failed';
+      setSolveError(errorText);
       checkBackend().then(setBackendOnline); // a solve error != backend offline
     } finally {
       setLoadingHeatmap(false);
+      await safeCreateExperiment({
+        name: `Radio map · ${coverageMetric} · ${selectedTransmitters.length} TX`, kind: 'radio_map', status,
+        startedAtUtc, completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
+        seed, configuration: { txs: selectedTransmitters, freqGhz, maxDepth, solverOptions, materials: materialList, coverageRequest, scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } },
+        parameters: { metric: coverageMetric, gridSize: resolution, gridHeight: height, samplesPerTx, seed, noiseFigureDb: coverageNoiseFigureDb, bandwidthHz: coverageBandwidthMhz * 1e6, maxDepth, frequencyGhz: freqGhz, transmitterCount: selectedTransmitters.length },
+        results: resultSummary, error: errorText,
+        replay: { endpoint: '/api/radiomap', body: replayBody, description: 'Repeat RadioMapSolver run' },
+      });
+    }
+  };
+
+  const sceneEnuBounds = React.useMemo(() => {
+    let xMin = Number.POSITIVE_INFINITY;
+    let xMax = Number.NEGATIVE_INFINITY;
+    let yMin = Number.POSITIVE_INFINITY;
+    let yMax = Number.NEGATIVE_INFINITY;
+    for (const item of buildings) {
+      for (const point of item.enuPoints ?? []) {
+        xMin = Math.min(xMin, point.x);
+        xMax = Math.max(xMax, point.x);
+        yMin = Math.min(yMin, point.y);
+        yMax = Math.max(yMax, point.y);
+      }
+    }
+    if (!Number.isFinite(xMin) || !Number.isFinite(xMax) || !Number.isFinite(yMin) || !Number.isFinite(yMax)) return null;
+    return { xMin, xMax, yMin, yMax };
+  }, [buildings]);
+
+  const currentExperimentConfiguration = React.useMemo(() => ({
+    tx, rx, freqGhz, maxDepth, solverOptions, materials: materialList,
+    scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint },
+  }), [tx, rx, freqGhz, maxDepth, solverOptions, materialList, anchor, buildings.length, sceneGeometryFingerprint]);
+
+  const handleApplyExperimentConfiguration = (configuration: Record<string, unknown>) => {
+    const cfg = configuration as Record<string, any>;
+    if (Number.isFinite(cfg.freqGhz)) handleSetFreqGhz(Number(cfg.freqGhz));
+    if (Number.isFinite(cfg.maxDepth)) setMaxDepth(Math.max(0, Math.min(10, Math.round(Number(cfg.maxDepth)))));
+    if (cfg.solverOptions && typeof cfg.solverOptions === 'object') setSolverOptions(cfg.solverOptions as SolverOptions);
+    if (Array.isArray(cfg.materials)) {
+      const next = Object.fromEntries((cfg.materials as MaterialConfig[]).filter((item) => item && typeof item.id === 'string').map((item) => [item.id, item]));
+      setMaterialConfigs((current) => ({ ...current, ...next }));
+    }
+    if (cfg.tx && typeof cfg.tx.id === 'string') {
+      const savedTx = cfg.tx as Transmitter;
+      setTxs((current) => current.some((item) => item.id === savedTx.id)
+        ? current.map((item) => item.id === savedTx.id ? savedTx : item)
+        : [...current, savedTx]);
+      setActiveTxId(savedTx.id);
+    }
+    if (cfg.rx && typeof cfg.rx.id === 'string') {
+      const savedRx = cfg.rx as Receiver;
+      setRxs((current) => current.some((item) => item.id === savedRx.id)
+        ? current.map((item) => item.id === savedRx.id ? savedRx : item)
+        : [...current, savedRx]);
+      setActiveRxId(savedRx.id);
+    }
+  };
+
+  const handleRetryExperiment = async (experiment: ExperimentRun) => {
+    if (!experiment.replay?.endpoint) throw new Error('This experiment has no saved replay payload.');
+    const replay = experiment.replay;
+    if (!replay.endpoint.startsWith('/api/')) throw new Error('Replay endpoint must use the local /api/ prefix.');
+    const startedAtUtc = new Date().toISOString();
+    const started = performance.now();
+    const retryRecord = await safeCreateExperiment({
+      name: `${experiment.name} · retry`, kind: experiment.kind, status: 'running', startedAtUtc,
+      seed: experiment.seed, configuration: experiment.configuration,
+      parameters: { ...experiment.parameters, retryOf: experiment.id },
+      results: { retryOf: experiment.id, status: 'starting' }, replay,
+    });
+    let retryWasCancelled = false;
+    try {
+      let raw: any;
+      if (experiment.kind === 'link_matrix' && Array.isArray((replay.body as any).txs) && Array.isArray((replay.body as any).rxs)) {
+        const matrix = replay.body as any;
+        const solvedPairs: any[] = [];
+        for (const t of matrix.txs) {
+          for (const r of matrix.rxs) {
+            const pairResponse = await fetch('/api/solve', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ tx: t, rx: r, buildings: matrix.buildings, freqGhz: matrix.freqGhz, maxDepth: matrix.maxDepth, options: matrix.options, materials: matrix.materials }),
+            });
+            if (!pairResponse.ok) {
+              let detail = `Link matrix pair failed (${pairResponse.status})`;
+              try { const body = await pairResponse.json(); detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail ?? body); } catch { /* keep fallback */ }
+              throw new Error(`${t.name} → ${r.name}: ${detail}`);
+            }
+            const pair = await pairResponse.json();
+            solvedPairs.push({ txId: t.id, rxId: r.id, pathCount: pair.paths?.length ?? 0, metrics: pair.metrics });
+          }
+        }
+        raw = { solvedPairs };
+      } else {
+        const response = await fetch(replay.endpoint, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(replay.body),
+        });
+        if (!response.ok) {
+          let detail = `Request failed (${response.status})`;
+          try { const body = await response.json(); detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail ?? body); } catch { /* keep status fallback */ }
+          throw new Error(detail);
+        }
+        raw = await response.json();
+      }
+      if (experiment.kind === 'measurement_raytrace' && raw?.jobId) {
+        const retryJobId = raw.jobId as string;
+        await safeUpdateExperiment(retryRecord?.id, { results: { jobId: retryJobId, status: 'running', progress: raw.progress ?? 0 } });
+        let status = raw.status;
+        for (let attempt = 0; attempt < 600 && ['running', 'cancelling'].includes(status); attempt += 1) {
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
+          raw = await getMeasurementRayTraceJob(retryJobId);
+          status = raw.status;
+        }
+        if (status === 'error') throw new Error(raw.message || 'Measurement ray-trace retry failed');
+        if (status === 'cancelled') { retryWasCancelled = true; throw new Error(raw.message || 'Measurement ray-trace retry was cancelled'); }
+        if (status !== 'done' || !raw.result) throw new Error('Measurement ray-trace retry exceeded the 15-minute polling window.');
+        raw = raw.result;
+      } else if (experiment.kind === 'phy_sweep' && raw?.jobId) {
+        const retryJobId = raw.jobId as string;
+        await safeUpdateExperiment(retryRecord?.id, { results: { jobId: retryJobId, status: 'running', progress: raw.progress ?? 0 } });
+        let status = raw.status;
+        for (let attempt = 0; attempt < 450 && ['running', 'cancelling'].includes(status); attempt += 1) {
+          await new Promise((resolve) => window.setTimeout(resolve, 2000));
+          raw = await getPhyBerStatus(retryJobId);
+          status = raw.status;
+        }
+        if (status === 'error') throw new Error(raw.message || 'PHY retry failed');
+        if (status === 'cancelled') { retryWasCancelled = true; throw new Error(raw.message || 'PHY retry was cancelled'); }
+        if (status !== 'done' || !raw.result) throw new Error('PHY retry exceeded the 15-minute polling window. Check Analysis for job status.');
+        raw = raw.result;
+      }
+      const resultSummary = experiment.kind === 'measurement_raytrace'
+        ? summarizeMeasurementRayTrace(raw)
+        : summarizeUnknownExperimentResult(experiment.kind, raw);
+      await safeUpdateExperiment(retryRecord?.id, {
+        status: 'done', completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
+        results: resultSummary, error: null,
+      });
+    } catch (error) {
+      const errorText = error instanceof Error ? error.message : String(error);
+      await safeUpdateExperiment(retryRecord?.id, {
+        status: retryWasCancelled ? 'cancelled' : 'error', completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
+        error: errorText,
+      });
+      throw error;
     }
   };
 
@@ -831,6 +1206,13 @@ export default function App() {
             trajectoryPoints={trajectoryPoints}
           />
 
+          <BaseStationImportPanel
+            anchor={anchor}
+            currentTxCount={txs.length}
+            onImport={handleImportBaseStations}
+            defaultArraySize={[1, 1]}
+          />
+
           <SolverControls
             tx={tx}
             rx={rx}
@@ -839,21 +1221,25 @@ export default function App() {
             activeMode={activeMode}
             setActiveMode={setActiveMode}
             freqGhz={freqGhz}
-            setFreqGhz={setFreqGhz}
+            setFreqGhz={handleSetFreqGhz}
             maxDepth={maxDepth}
             setMaxDepth={setMaxDepth}
             solverOptions={solverOptions}
             setSolverOptions={setSolverOptions}
           />
 
-          {activeMode === 'link' && (
+          {/* Keep mode panels mounted while hidden. Their local results, selected
+              cells and in-flight operation state must survive switching between
+              Link / Radio Coverage / Trajectory. Only the visible panel occupies
+              layout space. */}
+          <div className={activeMode === 'link' ? 'contents' : 'hidden'}>
             <LinkPanel
               txs={txs}
               rxs={rxs}
               activeTxId={activeTxId}
               activeRxId={activeRxId}
-              onSelectTx={setActiveTxId}
-              onSelectRx={setActiveRxId}
+              onSelectTx={handleSelectTx}
+              onSelectRx={handleSelectRx}
               onAddTx={addTx}
               onAddRx={addRx}
               onRemoveTx={removeTx}
@@ -870,17 +1256,27 @@ export default function App() {
               solveError={solveError}
               backendOnline={backendOnline}
             />
-          )}
+          </div>
 
-          {activeMode === 'heatmap' && (
+          <div className={activeMode === 'heatmap' ? 'contents' : 'hidden'}>
             <CoveragePanel
-              txCount={txs.length}
+              txCount={coverageBandFilter !== '__all__' ? coverageTxs.length : txs.length}
+              rx={rx}
+              bandOptions={coverageBandOptions}
+              selectedBand={coverageBandFilter}
+              onSelectBand={handleCoverageBandSelect}
               backendOnline={backendOnline}
               onRunHeatmap={handleRunHeatmap}
               heatmapLoading={loadingHeatmap}
               radioMap={radioMap}
+              anchor={anchor}
+              txs={coverageTxs}
+              onFocusCell={setFocusedRadioMapCellIndex}
+              focusedRadioMapCellIndex={focusedRadioMapCellIndex}
               coverageMetric={coverageMetric}
-              setCoverageMetric={setCoverageMetric}
+              setCoverageMetric={handleCoverageMetricChange}
+              coverageThresholdDb={coverageThresholdDb}
+              setCoverageThresholdDb={setCoverageThresholdDb}
               coverageBandwidthMhz={coverageBandwidthMhz}
               setCoverageBandwidthMhz={setCoverageBandwidthMhz}
               coverageNoiseFigureDb={coverageNoiseFigureDb}
@@ -905,9 +1301,9 @@ export default function App() {
               setRmVmax={setRmVmax}
               solveError={solveError}
             />
-          )}
+          </div>
 
-          {activeMode === 'playback' && (
+          <div className={activeMode === 'playback' ? 'contents' : 'hidden'}>
             <TrajectoryPanel
               txs={txs}
               activeTxId={activeTxId}
@@ -936,8 +1332,9 @@ export default function App() {
               mobilityHandover={mobilityHandover}
               solveError={solveError}
               backendOnline={backendOnline}
+              active={activeMode === 'playback'}
             />
-          )}
+          </div>
         </div>
 
         {/* Center/Right columns visualization viewport (8/12, 9/12 on wide screens) — content swaps with the top nav */}
@@ -957,6 +1354,7 @@ export default function App() {
               matrixPaths={matrixPaths}
               showRaysOnHeatmap={showRaysOnHeatmap}
               radioMap={radioMap}
+              focusedRadioMapCellIndex={focusedRadioMapCellIndex}
               rmColormap={rmColormap}
               rmAutoRange={rmAutoRange}
               rmVmin={rmVmin}
@@ -971,10 +1369,18 @@ export default function App() {
               mobilityRxPosition={activeMobilityStep?.rxPosition ?? null}
               trajectoryPoints={trajectoryPoints}
               setTrajectoryPoints={setTrajectoryPoints}
+              measurementOverlayPoints={measurementOverlayPoints}
+              measurementOverlayLabel={measurementOverlayLabel}
+              measurementOverlayVisible={measurementOverlayVisible}
+              setMeasurementOverlayVisible={setMeasurementOverlayVisible}
             />
           )}
 
-          {activeNavTab === 'geography' && (
+          {/* Keep workspaces alive across top-navigation changes. In particular,
+              Field Validation must retain its selected identity audit when its
+              "show in 3D" action navigates to the 3D scene, and Analysis must
+              keep polling a running PHY job while the user visits another tab. */}
+          <div className={activeNavTab === 'geography' ? 'contents' : 'hidden'}>
             <GeographyPanel
               buildings={buildings}
               anchor={anchor}
@@ -982,9 +1388,9 @@ export default function App() {
               materialConfigs={materialList}
               onMaterialChange={updateMaterial}
             />
-          )}
+          </div>
 
-          {activeNavTab === 'analysis' && (
+          <div className={activeNavTab === 'analysis' ? 'contents' : 'hidden'}>
             <AnalysisPanel
               tx={tx}
               rx={rx}
@@ -998,9 +1404,22 @@ export default function App() {
               materials={materialList}
               backendOnline={backendOnline}
             />
-          )}
+          </div>
 
-          {activeNavTab === 'export' && (
+          <div className={activeNavTab === 'field_validation' ? 'contents' : 'hidden'}>
+            <FieldValidationPanel backendOnline={backendOnline} anchor={anchor} sceneBounds={sceneEnuBounds} transmitters={txs} rxArraySize={rx.antennaArraySize} buildings={buildings} freqGhz={freqGhz} maxDepth={maxDepth} solverOptions={solverOptions} materials={materialList} onShowMeasurementsIn3D={showMeasurementOverlayIn3D} onClearMeasurementOverlay={clearMeasurementOverlay} />
+          </div>
+
+          <div className={activeNavTab === 'experiments' ? 'contents' : 'hidden'}>
+            <ExperimentPanel
+              backendOnline={backendOnline}
+              currentConfiguration={currentExperimentConfiguration}
+              onApplyConfiguration={handleApplyExperimentConfiguration}
+              onRetryExperiment={handleRetryExperiment}
+            />
+          </div>
+
+          <div className={activeNavTab === 'export' ? 'contents' : 'hidden'}>
             <ExportPanel
               buildings={buildings}
               anchor={anchor}
@@ -1019,7 +1438,7 @@ export default function App() {
               onImportProject={handleImportProject}
               onResetProject={handleResetProject}
             />
-          )}
+          </div>
 
           {/* User tips documentation helper */}
           <div className="panel p-4 text-[14px] flex gap-3.5 text-slate-300">

@@ -3,11 +3,14 @@
 Field names are camelCase on purpose so the JSON the React app already produces
 and consumes maps 1:1 with no alias gymnastics.
 """
+# Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+# Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 from __future__ import annotations
 
-from typing import List, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ENUVector(BaseModel):
@@ -34,12 +37,25 @@ class Transmitter(BaseModel):
     name: str = "Tx"
     enu: ENUVector
     height: float = 10.0
+    # None preserves the legacy behaviour (height above a detected roof).
+    heightReference: Optional[Literal["agl", "roof", "scene_z"]] = None
     powerDbm: float = 30.0
     antennaArraySize: Tuple[int, int] = (8, 8)  # [horizontal, vertical]
     beamsteeringAzimuth: float = 0.0
     beamsteeringElevation: float = 0.0
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # Imported inventory metadata; not silently converted into an antenna model.
+    site: Optional[str] = None
+    transmitterLabel: Optional[str] = None
+    antennaModel: Optional[str] = None
+    frequencyBand: Optional[str] = None
+    carrierFrequencyGhz: Optional[float] = None
+    sourcePowerDbm: Optional[float] = None
+    powerReference: Optional[Literal["conducted", "eirp"]] = None
+    antennaGainDbi: Optional[float] = None
+    mechanicalDowntiltDeg: Optional[float] = None
+    electricalDowntiltDeg: Optional[float] = None
 
 
 class Receiver(BaseModel):
@@ -93,26 +109,141 @@ class RadioMapCell(BaseModel):
     x: float
     y: float
     z: float
-    powerDbm: float       # best-server received power (RSS) [dBm]
-    # Geometric LOS approximation from the 2D footprints, NOT a Sionna RadioMap
-    # output (which exposes path gain / RSS / SINR only). Used only as a UI and
-    # synthetic channel-grid hint.
-    isLos: bool
-    sinr: Optional[float] = None      # best-server signal-to-interference-plus-noise [dB]
-    servingTx: Optional[int] = None   # index of the serving transmitter
+    # Best-RSS serving cell outputs. powerDbm is always the native Sionna RSS
+    # converted from W to dBm; metricValue is the currently selected map layer.
+    powerDbm: float
+    isLos: Optional[bool] = None
+    sinr: Optional[float] = None
+    servingTx: Optional[int] = None
+    bestSinrTx: Optional[int] = None
+    bestSinrDb: Optional[float] = None  # highest per-Tx SINR; may differ from RSS serving TX
+    bestPathGainTx: Optional[int] = None
+    pathGainDb: Optional[float] = None  # strongest path gain, independent of TX power
+    effectivePathLossDb: Optional[float] = None
+    competingSectorCount: Optional[int] = None
+    interferencePowerDbm: Optional[float] = None
+    sirDb: Optional[float] = None
+    inrDb: Optional[float] = None
+    dominanceMarginDb: Optional[float] = None
+    topInterfererTx: Optional[int] = None
+    topInterfererPowerDbm: Optional[float] = None
+    topInterferenceSharePercent: Optional[float] = None
+    metricValue: Optional[float] = None
 
 
 class CoverageStats(BaseModel):
-    """Coverage statistics over the radio map for the selected metric."""
-    metric: str            # "power" | "sinr"
-    unit: str              # "dBm" | "dB"
-    thresholdDb: float     # served threshold used
-    servedPercent: float   # % of reachable cells at/above the threshold
-    p5: float
-    p50: float
-    p95: float
-    minVal: float
-    maxVal: float
+    """Coverage statistics computed against the entire measurement surface."""
+    metric: str
+    unit: str
+    thresholdDb: float
+    thresholdComparison: Literal["at_or_above", "at_or_below"] = "at_or_above"
+    servedPercent: float
+    outagePercent: float = 0.0
+    reachablePercent: float = 0.0
+    servedAreaKm2: float = 0.0
+    totalAreaKm2: float = 0.0
+    cellAreaM2: float = 0.0
+    count: int = 0
+    reachableCount: int = 0
+    mean: Optional[float] = None
+    std: Optional[float] = None
+    p5: Optional[float] = None
+    p10: Optional[float] = None
+    p25: Optional[float] = None
+    p50: Optional[float] = None
+    p75: Optional[float] = None
+    p90: Optional[float] = None
+    p95: Optional[float] = None
+    minVal: Optional[float] = None
+    maxVal: Optional[float] = None
+    cdf: List[dict] = Field(default_factory=list)
+    histogram: List[dict] = Field(default_factory=list)
+    meanRssDbm: Optional[float] = None
+    meanPathGainDb: Optional[float] = None
+    meanSinrDb: Optional[float] = None
+    meanBestSinrDb: Optional[float] = None
+    meanInterferenceDbm: Optional[float] = None
+    noisePowerDbm: Optional[float] = None
+    overlapRssThresholdDbm: float = -100.0
+    overlapPercent: float = 0.0
+    meanCompetingSectors: float = 0.0
+
+
+class TransmitterRadioStats(BaseModel):
+    txIndex: int
+    txId: str
+    txName: str
+    site: Optional[str] = None
+    frequencyBand: Optional[str] = None
+    powerDbm: Optional[float] = None
+    meanRssDbm: Optional[float] = None
+    rssP5Dbm: Optional[float] = None
+    rssP50Dbm: Optional[float] = None
+    rssP95Dbm: Optional[float] = None
+    meanSinrDb: Optional[float] = None
+    sinrP5Db: Optional[float] = None
+    sinrP50Db: Optional[float] = None
+    sinrP95Db: Optional[float] = None
+    meanPathGainDb: Optional[float] = None
+    servingCellCount: int = 0
+    servingPercent: float = 0.0
+    rssCoverageThresholdDbm: float = -100.0
+    rssCoveragePercent: float = 0.0
+    rssCoverageAreaKm2: float = 0.0
+    sinrCoverageThresholdDb: float = 0.0
+    sinrCoveragePercent: float = 0.0
+    sinrCoverageAreaKm2: float = 0.0
+
+
+
+    rssStdDb: Optional[float] = None
+    rssMinDbm: Optional[float] = None
+    rssMaxDbm: Optional[float] = None
+    rssP10Dbm: Optional[float] = None
+    rssP25Dbm: Optional[float] = None
+    rssP75Dbm: Optional[float] = None
+    rssP90Dbm: Optional[float] = None
+    sinrStdDb: Optional[float] = None
+    sinrMinDb: Optional[float] = None
+    sinrMaxDb: Optional[float] = None
+    sinrP10Db: Optional[float] = None
+    sinrP25Db: Optional[float] = None
+    sinrP75Db: Optional[float] = None
+    sinrP90Db: Optional[float] = None
+    pathGainP5Db: Optional[float] = None
+    pathGainP50Db: Optional[float] = None
+    pathGainP95Db: Optional[float] = None
+    meanSnrDb: Optional[float] = None
+    meanInterferenceDbm: Optional[float] = None
+    meanSirDb: Optional[float] = None
+    meanInrDb: Optional[float] = None
+    sinrAssociationCellCount: int = 0
+    sinrAssociationPercent: float = 0.0
+    pathGainAssociationCellCount: int = 0
+    pathGainAssociationPercent: float = 0.0
+    rssReachablePercent: float = 0.0
+    topInterfererCells: int = 0
+    topInterfererCellPercent: float = 0.0
+    meanTopInterferenceDbm: Optional[float] = None
+    meanTopInterferenceSharePercent: float = 0.0
+    leaveOneOut: Optional[dict] = None
+
+
+class SiteRadioStats(BaseModel):
+    site: str
+    sectorCount: int
+    meanRssDbm: Optional[float] = None
+    meanSinrDb: Optional[float] = None
+    meanPathGainDb: Optional[float] = None
+    rssP5Dbm: Optional[float] = None
+    rssP50Dbm: Optional[float] = None
+    rssP95Dbm: Optional[float] = None
+    servingCellCount: int = 0
+    servingPercent: float = 0.0
+    rssCoveragePercent: float = 0.0
+    rssCoverageAreaKm2: float = 0.0
+    sinrCoveragePercent: float = 0.0
+    sinrCoverageAreaKm2: float = 0.0
 
 
 class RadioMapGrid(BaseModel):
@@ -123,9 +254,15 @@ class RadioMapGrid(BaseModel):
     maxY: float
     gridSize: float
     heightOffset: float
-    metric: str = "power"             # which field `powerDbm` carries
+    metric: str = "power"
     unit: str = "dBm"
     stats: Optional[CoverageStats] = None
+    txStats: List[TransmitterRadioStats] = Field(default_factory=list)
+    siteStats: List[SiteRadioStats] = Field(default_factory=list)
+    associationStats: Optional[dict] = None
+    mapId: Optional[str] = None
+    noisePowerDbm: Optional[float] = None
+    simulationConfig: Optional[dict] = None
     samplesPerTx: int = 1_000_000
     seed: int = 42
 
@@ -172,6 +309,16 @@ class MaterialConfig(BaseModel):
     thickness: Optional[float] = None     # m
 
 
+
+
+class OSMQueryRequest(BaseModel):
+    """A bounded OSM tile request forwarded by the backend to Overpass."""
+    south: float = Field(ge=-90, le=90)
+    west: float = Field(ge=-180, le=180)
+    north: float = Field(ge=-90, le=90)
+    east: float = Field(ge=-180, le=180)
+
+
 class SolveRequest(BaseModel):
     tx: Transmitter
     rx: Receiver
@@ -198,10 +345,12 @@ class RadioMapRequest(BaseModel):
     options: SolverOptions = Field(default_factory=SolverOptions)
     materials: List[MaterialConfig] = Field(default_factory=list)
     # Which Sionna metric to map: best-server received power, or interference-aware SINR.
-    metric: Literal["power", "sinr"] = "power"
+    metric: Literal["power", "path_gain", "path_loss", "sinr", "best_sinr", "interference", "sir", "inr", "dominance"] = "power"
     bandwidthHz: float = 100e6   # sets scene.bandwidth → thermal noise for SINR
     noiseFigureDb: float = 7.0   # receiver noise figure added to thermal noise
-    coverageThresholdDb: Optional[float] = None  # served threshold (per-metric default)
+    coverageThresholdDb: Optional[float] = None  # selected metric threshold
+    rssCoverageThresholdDb: float = -100.0
+    sinrCoverageThresholdDb: float = 0.0
     # Research/reproducibility controls passed directly to RadioMapSolver.
     samplesPerTx: int = Field(default=1_000_000, ge=1_000, le=10_000_000)
     seed: int = Field(default=42, ge=0, le=2_147_483_647)
@@ -505,7 +654,7 @@ class LinkKpiResponse(BaseModel):
     capacityOpenLoopBitsHz: float    # log2 det(I + rho/Nt · H Hᴴ), no CSIT
     capacityBeamformedBitsHz: float  # single-stream MRT/MRC upper reference
     capacityUniformBitsHz: float     # the app's sum/sqrt(Nt) steered precoder
-    throughputMbps: float            # open-loop capacity × bandwidth
+    throughputMbps: float            # Shannon-rate upper bound × bandwidth; not scheduled NR goodput
     beamformingGainDb: Optional[float]  # MRT vs the steered uniform beam
     # Spatial structure of the frequency-averaged transmit covariance.
     conditionNumberDb: Optional[float]
@@ -519,13 +668,19 @@ class LinkKpiResponse(BaseModel):
 # ── Full PHY chain: NR PUSCH BER/BLER sweep (Tier 2, optional package) ──────
 
 class PhyBerRequest(BaseModel):
-    """BER/BLER-vs-Eb/N0 sweep of the active link through Sionna PHY's 5G NR
-    PUSCH chain (LDPC + QAM + DMRS + LMMSE), replaying the ray-traced CIR.
+    """FR1 NR PUSCH BER/BLER sweep over a reciprocal ray-traced CIR.
 
-    Runs as a background job: the RT solve holds the solver lock briefly, the
-    CPU-side PHY sweep does not. Requires the optional ``sionna`` PHY package
-    (see /api/health ``phy``). The CFR is normalized to unit average energy, so
-    ``ebNoDb`` is relative to mean received symbol energy.
+    ``channelMode="normalized"`` normalizes the RT CFR and sweeps the requested
+    Eb/N0 values. ``channelMode="absolute"`` preserves RT path gain and derives
+    baseline receiver noise from UE conducted Tx power, occupied bandwidth,
+    receiver NF, and 293 K thermal noise. In absolute mode, the sweep bounds
+    are Eb/N0 offsets around the physical link-budget operating point; offset
+    zero is the actual modeled link-budget point. Neither mode includes
+    inter-cell interference, UE power control, HARQ, or a complete NR scheduler.
+
+    A nominal channel bandwidth determines the PRB count from the FR1 3GPP
+    TS 38.104 table. Legacy callers may still pass ``numPrb`` directly when
+    ``channelBandwidthMHz`` is omitted.
     """
     tx: Transmitter
     rx: Receiver
@@ -534,25 +689,63 @@ class PhyBerRequest(BaseModel):
     maxDepth: int = 3
     options: SolverOptions = Field(default_factory=SolverOptions)
     materials: List[MaterialConfig] = Field(default_factory=list)
-    # PUSCH configuration (3GPP 38.214 MCS table 1) + sweep grid.
-    mcsIndex: int = Field(default=14, ge=0, le=27)
+    # FR1 PUSCH resource grid and TS 38.214 MCS table selection.
+    mcsIndex: int = Field(default=14, ge=0, le=28)
+    mcsTable: Literal[1, 2, 3] = 1
+    channelBandwidthMHz: Optional[int] = Field(default=None, ge=5, le=100)
     numPrb: int = Field(default=24, ge=4, le=273)
-    subcarrierSpacing: float = 30_000.0  # Hz (15/30/60/120 kHz)
-    # solve_cir plumbing: the sweep re-samples the CIR on the PUSCH grid, so the
-    # incidental CFR stays tiny; delay normalization aligns taps with the CP.
+    subcarrierSpacing: float = 30_000.0  # Hz; FR1 supports 15/30/60 kHz here
+    nCellId: int = Field(default=1, ge=0, le=1007)
+    cyclicPrefix: Literal["normal", "extended"] = "normal"
+    dmrsConfigType: Literal[1, 2] = 1
+    dmrsAdditionalPosition: int = Field(default=0, ge=0, le=3)
+    channelMode: Literal["normalized", "absolute"] = "normalized"
+    # PUSCH is uplink: this is UE conducted Tx power, not the BS tx.powerDbm
+    # value used for the reciprocal RT geometry/array response.
+    ueTxPowerDbm: float = Field(default=23.0, ge=-10.0, le=33.0)
+    receiverNoiseFigureDb: float = Field(default=7.0, ge=0.0, le=20.0)
+    # solve_cir plumbing: CFR is re-sampled on the PUSCH grid; normalized
+    # delays retain relative excess delay so CP suitability can be reported.
     numSubcarriers: int = 64
     normalizeDelays: bool = True
     snrMinDb: float = -10.0
     snrMaxDb: float = 14.0
-    snrStepDb: float = Field(default=2.0, gt=0.0)
+    # In normalized mode these are Eb/N0 dB. In absolute mode they are dB
+    # offsets around the link-budget-derived baseline Eb/N0.
+    snrStepDb: float = Field(default=1.0, gt=0.0)
     slotsPerPoint: int = Field(default=32, ge=4, le=512)
     seed: int = Field(default=42, ge=0, le=2_147_483_647)
+
+    @model_validator(mode="after")
+    def validate_nr_configuration(self):
+        from .nr_config import build_sweep_points, resolve_fr1_resource_grid, validate_mcs_index
+
+        scs_hz = int(round(self.subcarrierSpacing))
+        if float(scs_hz) != float(self.subcarrierSpacing) or scs_hz not in (15_000, 30_000, 60_000):
+            raise ValueError("FR1 PUSCH SCS must be exactly 15000, 30000, or 60000 Hz")
+        if self.channelBandwidthMHz is not None:
+            grid = resolve_fr1_resource_grid(self.channelBandwidthMHz, scs_hz)
+            # The standards table is authoritative when a nominal channel
+            # bandwidth is provided; this also keeps older default numPrb from
+            # accidentally overriding the selected FR1 bandwidth.
+            self.numPrb = grid.num_prb
+        validate_mcs_index(int(self.mcsTable), int(self.mcsIndex))
+        if self.cyclicPrefix == "extended" and scs_hz != 60_000:
+            raise ValueError("Extended cyclic prefix is only supported at 60 kHz SCS")
+        build_sweep_points(self.snrMinDb, self.snrMaxDb, self.snrStepDb)
+        return self
 
 
 class PhyBerPoint(BaseModel):
     ebNoDb: float
+    linkBudgetOffsetDb: Optional[float] = None
     ber: float
     bler: float
+    berCi95Lower: float
+    berCi95Upper: float
+    blerCi95Lower: float
+    blerCi95Upper: float
+    goodputMbps: float
     bitErrors: int
     bits: int
     blockErrors: int
@@ -562,11 +755,25 @@ class PhyBerPoint(BaseModel):
 class PhyBerResult(BaseModel):
     points: List[PhyBerPoint]
     mcsIndex: int
+    mcsTable: int
     modulationOrder: int      # bits per QAM symbol
     targetCoderate: float
     numPrb: int
     numSubcarriers: int
     subcarrierSpacingHz: float
+    channelBandwidthMHz: Optional[int] = None
+    occupiedBandwidthHz: int
+    nCellId: int
+    cyclicPrefix: str
+    dmrsConfigType: int
+    dmrsAdditionalPosition: int
+    numSymbolsPerSlot: int
+    slotDurationSeconds: float
+    maxExcessDelayNs: float
+    approxMinimumCpNs: float
+    channelNormalized: bool
+    channelDirection: str
+    interferenceModel: str
     numRxAnt: int             # base-station elements (uplink receive side)
     numTxAnt: int             # effective PUSCH streams (currently one)
     numUeArrayPorts: int      # physical UE ports under the uniform precoder
@@ -574,17 +781,56 @@ class PhyBerResult(BaseModel):
     slotsPerPoint: int
     transportBlockBits: int
     seed: int
+    channelMode: Literal["normalized", "absolute"] = "normalized"
+    sweepAxis: Literal["ebno", "link_budget_offset"] = "ebno"
+    # Absolute-mode diagnostics. rxPowerDbm is mean combined signal power
+    # across BS receive branches; noisePowerDbm is thermal+NF noise over
+    # occupied bandwidth for one BS receive branch.
+    linkBudgetEbNoDb: Optional[float] = None
+    # Mean link-budget reference SNR from averaged channel gain; not a per-RE
+    # equalizer/decoder output SINR.
+    effectiveSnrDb: Optional[float] = None
+    rxPowerDbm: Optional[float] = None
+    noisePowerDbm: Optional[float] = None
+    noiseBandwidthHz: Optional[float] = None
+    meanChannelGainDb: Optional[float] = None
+    ueTxPowerDbm: Optional[float] = None
+    receiverNoiseFigureDb: Optional[float] = None
+    noiseTemperatureK: Optional[float] = None
 
 
 class PhyBerJobStatus(BaseModel):
     jobId: str
-    status: Literal["running", "done", "error"]
+    status: Literal["running", "cancelling", "done", "error", "cancelled"]
     progress: float           # 0..1
     message: str = ""
     result: Optional[PhyBerResult] = None
 
 
 # ── Per-cell ray-traced channel grid ────────────────────────────────────────
+
+class ChannelAnalysisRequest(BaseModel):
+    """Run PathSolver at selected cells from a cached RadioMapSolver grid."""
+    cellIndices: List[int] = Field(min_length=1, max_length=12)
+    txMode: Literal["serving", "serving_and_interferer", "selected", "all"] = "serving_and_interferer"
+    txIndex: Optional[int] = Field(default=None, ge=0)
+    rxArraySize: Tuple[int, int] = (1, 1)
+    numSubcarriers: int = Field(default=64, ge=8, le=256)
+    subcarrierSpacingHz: float = Field(default=30_000.0, gt=0, le=10_000_000)
+    pathsToReturn: int = Field(default=24, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def validate_selection(self):
+        if len(set(self.cellIndices)) != len(self.cellIndices):
+            raise ValueError("cellIndices must not contain duplicates")
+        if any(index < 0 for index in self.cellIndices):
+            raise ValueError("cellIndices must be non-negative")
+        if len(self.rxArraySize) != 2 or any(int(value) < 1 for value in self.rxArraySize):
+            raise ValueError("rxArraySize must contain two positive integers")
+        if self.txMode == "selected" and self.txIndex is None:
+            raise ValueError("txIndex is required when txMode is 'selected'")
+        return self
+
 
 class ChannelGridRequest(BaseModel):
     """Build a per-cell channel grid by ray-tracing every radio-map cell.
@@ -611,3 +857,95 @@ class ChannelGridRequest(BaseModel):
     subcarrierSpacing: float = 30_000.0  # Hz
     normalizeDelays: bool = True
     chunkSize: int = 512                 # receivers per GPU dispatch (bounds memory)
+
+
+class MeasurementSceneBounds(BaseModel):
+    xMin: float
+    xMax: float
+    yMin: float
+    yMax: float
+
+    @model_validator(mode="after")
+    def validate_bounds(self):
+        if self.xMin > self.xMax or self.yMin > self.yMax:
+            raise ValueError("Scene bounds minimum must not exceed maximum")
+        return self
+
+
+class MeasurementGeospatialAuditRequest(BaseModel):
+    anchorLatitude: float = Field(ge=-90.0, le=90.0)
+    anchorLongitude: float = Field(ge=-180.0, le=180.0)
+    sceneBounds: Optional[MeasurementSceneBounds] = None
+
+
+class MeasurementMatchingAuditRequest(BaseModel):
+    """Build an identity/geospatial candidate audit for measured radio records."""
+    anchorLatitude: float = Field(ge=-90.0, le=90.0)
+    anchorLongitude: float = Field(ge=-180.0, le=180.0)
+    sceneBounds: Optional[MeasurementSceneBounds] = None
+    transmitters: List[Transmitter] = Field(default_factory=list, max_length=128)
+    rat: Optional[str] = Field(default="NR5G-NSA", max_length=32)
+    profileId: Optional[str] = Field(default=None, max_length=64)
+    pci: Optional[int] = Field(default=None, ge=0, le=1007)
+    band: Optional[int] = Field(default=None, ge=1, le=1024)
+    arfcn: Optional[int] = Field(default=None, ge=0, le=3_279_165)
+    previewLimit: int = Field(default=12, ge=1, le=100)
+
+
+class MeasurementRayTraceRequest(BaseModel):
+    """Run a bounded downlink PathSolver sample at real measurement positions."""
+    anchorLatitude: float = Field(ge=-90.0, le=90.0)
+    anchorLongitude: float = Field(ge=-180.0, le=180.0)
+    sceneBounds: Optional[MeasurementSceneBounds] = None
+    profileId: str = Field(min_length=1, max_length=64)
+    tx: Transmitter
+    buildings: List[BuildingFootprint]
+    freqGhz: float = Field(default=3.5, gt=0.1, le=300.0)
+    maxDepth: int = Field(default=3, ge=0, le=10)
+    options: SolverOptions = Field(default_factory=SolverOptions)
+    materials: List[MaterialConfig] = Field(default_factory=list)
+    rxHeightM: float = Field(default=1.5, ge=0.2, le=10.0)
+    sampleCount: int = Field(default=25, ge=1, le=100)
+    rxArraySize: Tuple[int, int] = (1, 1)
+
+
+# ── Persistent experiment history and configuration presets ────────────────
+
+class ExperimentCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    kind: str = Field(min_length=1, max_length=80)
+    status: Literal["running", "done", "error", "cancelled"] = "done"
+    startedAtUtc: Optional[str] = None
+    completedAtUtc: Optional[str] = None
+    durationMs: Optional[float] = Field(default=None, ge=0.0)
+    configurationFingerprint: Optional[str] = Field(default=None, max_length=128)
+    seed: Optional[int] = None
+    configuration: dict[str, Any] = Field(default_factory=dict)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    results: dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = Field(default=None, max_length=4000)
+    replay: Optional[dict[str, Any]] = None
+
+
+class ExperimentUpdateRequest(BaseModel):
+    status: Optional[Literal["running", "done", "error", "cancelled"]] = None
+    configurationFingerprint: Optional[str] = Field(default=None, max_length=128)
+    completedAtUtc: Optional[str] = None
+    durationMs: Optional[float] = Field(default=None, ge=0.0)
+    results: Optional[dict[str, Any]] = None
+    error: Optional[str] = Field(default=None, max_length=4000)
+    replay: Optional[dict[str, Any]] = None
+
+
+class ConfigurationPresetCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=500)
+    configuration: dict[str, Any]
+
+
+class MeasurementRayTraceJobStatus(BaseModel):
+    jobId: str
+    status: Literal["running", "cancelling", "done", "error", "cancelled"]
+    progress: float = Field(ge=0.0, le=1.0)
+    message: str = ""
+    result: Optional[dict[str, Any]] = None

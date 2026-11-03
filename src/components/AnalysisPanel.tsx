@@ -1,3 +1,6 @@
+// Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+// Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -6,11 +9,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Transmitter, Receiver, PropagationPath, ChannelMetrics, RadioMapGrid, InteractionKind, BuildingFootprint, SolverOptions, MaterialConfig } from '../types';
 import { calculatePathLoss } from '../utils';
-import { Zap, Activity, Waves, Scaling, AlertCircle, Info, Compass, Gauge, Radio } from 'lucide-react';
+import { Zap, Activity, Waves, Scaling, AlertCircle, Info, Compass, Gauge, Radio, Square } from 'lucide-react';
 import { NumberField } from './NumberField';
+import { safeCreateExperiment, safeUpdateExperiment, sha256Json, summarizeUnknownExperimentResult } from '../lib/experimentLogging';
 import {
   solveLinkKpi, LinkKpiResponse,
-  checkPhyAvailable, startPhyBerSweep, getPhyBerStatus, PhyBerResult,
+  checkPhyAvailable, startPhyBerSweep, getPhyBerStatus, cancelPhyBerJob, PhyBerResult,
 } from '../api';
 
 interface AnalysisPanelProps {
@@ -27,6 +31,12 @@ interface AnalysisPanelProps {
   materials: MaterialConfig[];
   backendOnline: boolean;
 }
+
+const FR1_PRB_TABLE: Record<number, Record<number, number>> = {
+  15: { 5: 25, 10: 52, 15: 79, 20: 106, 25: 133, 30: 160, 35: 188, 40: 216, 45: 242, 50: 270 },
+  30: { 5: 11, 10: 24, 15: 38, 20: 51, 25: 65, 30: 78, 35: 92, 40: 106, 45: 119, 50: 133, 60: 162, 70: 189, 80: 217, 90: 245, 100: 273 },
+  60: { 10: 11, 15: 18, 20: 24, 25: 31, 30: 38, 35: 44, 40: 51, 45: 58, 50: 65, 60: 79, 70: 93, 80: 107, 90: 121, 100: 135 },
+};
 
 const INTERACTION_COLORS: Record<InteractionKind, string> = {
   specular: '#4a727e',
@@ -50,13 +60,27 @@ export function AnalysisPanel({ tx, rx, paths, metrics, freqGhz, radioMap, build
   const [phyAvailable, setPhyAvailable] = useState(false);
   const [phyResult, setPhyResult] = useState<PhyBerResult | null>(null);
   const [phyJobId, setPhyJobId] = useState<string | null>(null);
+  const [phyExperimentId, setPhyExperimentId] = useState<string | null>(null);
+  const phyExperimentStartedAt = useRef<number>(0);
   const [phyProgress, setPhyProgress] = useState(0);
   const [phyMessage, setPhyMessage] = useState('');
   const [phyError, setPhyError] = useState('');
   const [phyMcs, setPhyMcs] = useState(14);
-  const [phyPrb, setPhyPrb] = useState(24);
+  const [phyMcsTable, setPhyMcsTable] = useState<1 | 2 | 3>(1);
+  const [phyBandwidthMHz, setPhyBandwidthMHz] = useState(20);
+  const [phyScsKhz, setPhyScsKhz] = useState(30);
+  const [phyCellId, setPhyCellId] = useState(1);
+  const [phyCyclicPrefix, setPhyCyclicPrefix] = useState<'normal' | 'extended'>('normal');
+  const [phyDmrsType, setPhyDmrsType] = useState<1 | 2>(1);
+  const [phyDmrsAdditional, setPhyDmrsAdditional] = useState<0 | 1 | 2 | 3>(0);
+  const [phyChannelMode, setPhyChannelMode] = useState<'normalized' | 'absolute'>('normalized');
+  const [phyUeTxPowerDbm, setPhyUeTxPowerDbm] = useState(23);
+  const [phyReceiverNoiseFigureDb, setPhyReceiverNoiseFigureDb] = useState(7);
+  const phyPrb = FR1_PRB_TABLE[phyScsKhz]?.[phyBandwidthMHz] ?? 0;
+  const phyBandwidthOptions = Object.keys(FR1_PRB_TABLE[phyScsKhz] || {}).map(Number);
   const [phySnrMin, setPhySnrMin] = useState(-10);
   const [phySnrMax, setPhySnrMax] = useState(14);
+  const [phySnrStep, setPhySnrStep] = useState(1);
   const [phySlots, setPhySlots] = useState(32);
 
   // Results are only valid for the link configuration they were requested
@@ -68,47 +92,138 @@ export function AnalysisPanel({ tx, rx, paths, metrics, freqGhz, radioMap, build
     if (backendOnline) checkPhyAvailable().then(setPhyAvailable);
   }, [backendOnline]);
 
-  // Poll the background job while it runs. A superseded job keeps polling —
-  // the backend runs one job at a time, so the busy state is real — but its
-  // result is dropped instead of surfacing under the new configuration.
+  // Poll the background job with one request in flight at a time. A sweep can
+  // take minutes; status reads should be short, but transient proxy/CPU delays
+  // must not mark the still-running backend job as failed. Retry with bounded
+  // backoff and keep the job ID so the user cannot accidentally start a second
+  // job while the first one is still executing.
   useEffect(() => {
     if (!phyJobId) return;
-    const id = window.setInterval(async () => {
+
+    let cancelled = false;
+    let timer: number | undefined;
+    let consecutiveFailures = 0;
+
+    const scheduleNext = (delayMs: number) => {
+      if (!cancelled) timer = window.setTimeout(poll, delayMs);
+    };
+
+    const poll = async () => {
+      if (cancelled) return;
       const live = phyJobEpoch.current === configEpoch.current;
       try {
         const st = await getPhyBerStatus(phyJobId);
+        if (cancelled) return;
+        consecutiveFailures = 0;
         setPhyProgress(st.progress);
         setPhyMessage(live ? st.message : 'Finishing superseded sweep…');
         if (st.status === 'done') {
           if (live) setPhyResult(st.result ?? null);
+          if (st.result) void safeUpdateExperiment(phyExperimentId, {
+            status: 'done', completedAtUtc: new Date().toISOString(),
+            durationMs: phyExperimentStartedAt.current ? performance.now() - phyExperimentStartedAt.current : undefined,
+            results: summarizeUnknownExperimentResult('phy_sweep', st.result), error: null,
+          });
           setPhyJobId(null);
-        } else if (st.status === 'error') {
-          if (live) setPhyError(st.message);
-          setPhyJobId(null);
+          setPhyExperimentId(null);
+          return;
         }
+        if (st.status === 'error') {
+          if (live) setPhyError(st.message);
+          void safeUpdateExperiment(phyExperimentId, { status: 'error', completedAtUtc: new Date().toISOString(), durationMs: phyExperimentStartedAt.current ? performance.now() - phyExperimentStartedAt.current : undefined, error: st.message });
+          setPhyJobId(null);
+          setPhyExperimentId(null);
+          return;
+        }
+        if (st.status === 'cancelled') {
+          if (live) setPhyMessage(st.message || 'Sweep cancelled');
+          void safeUpdateExperiment(phyExperimentId, { status: 'cancelled', completedAtUtc: new Date().toISOString(), durationMs: phyExperimentStartedAt.current ? performance.now() - phyExperimentStartedAt.current : undefined, error: st.message });
+          setPhyJobId(null);
+          setPhyExperimentId(null);
+          return;
+        }
+        scheduleNext(2000);
       } catch (e: any) {
-        if (live) setPhyError(e?.message || 'PHY status poll failed');
-        setPhyJobId(null);
+        if (cancelled) return;
+        const message = e?.message || 'PHY status poll failed';
+        // A 404 means the backend process/job registry was reset; retrying
+        // cannot recover that job. Other failures may be transient.
+        if (/unknown phy job|404/i.test(String(message))) {
+          if (live) setPhyError(`${message}. The backend no longer has this job; check its log before starting another sweep.`);
+          void safeUpdateExperiment(phyExperimentId, { status: 'error', completedAtUtc: new Date().toISOString(), error: `${message}. Backend job registry unavailable.` });
+          setPhyJobId(null);
+          setPhyExperimentId(null);
+          return;
+        }
+        consecutiveFailures += 1;
+        const retryMs = Math.min(15_000, 2000 * (2 ** Math.min(consecutiveFailures - 1, 3)));
+        if (live) {
+          setPhyMessage(`Status check delayed (${message}); retrying in ${Math.round(retryMs / 1000)}s…`);
+        }
+        scheduleNext(retryMs);
       }
-    }, 1500);
-    return () => window.clearInterval(id);
-  }, [phyJobId]);
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [phyJobId, phyExperimentId]);
 
   const runPhySweep = async () => {
     phyJobEpoch.current = configEpoch.current;
+    const startedAtUtc = new Date().toISOString();
+    const started = performance.now();
+    phyExperimentStartedAt.current = started;
+    setPhyExperimentId(null);
     setPhyError('');
     setPhyResult(null);
     setPhyProgress(0);
     setPhyMessage('Starting…');
+    const phyOptions = {
+      mcsIndex: phyMcs, mcsTable: phyMcsTable, channelBandwidthMHz: phyBandwidthMHz,
+      subcarrierSpacing: phyScsKhz * 1000, nCellId: phyCellId, cyclicPrefix: phyCyclicPrefix,
+      dmrsConfigType: phyDmrsType, dmrsAdditionalPosition: phyDmrsAdditional,
+      channelMode: phyChannelMode, ueTxPowerDbm: phyUeTxPowerDbm,
+      receiverNoiseFigureDb: phyReceiverNoiseFigureDb,
+      snrMinDb: phySnrMin, snrMaxDb: phySnrMax, snrStepDb: phySnrStep,
+      slotsPerPoint: phySlots,
+    };
+    const replayBody = { tx, rx, buildings, freqGhz, maxDepth, options: solverOptions, materials, ...phyOptions, seed: 42 };
+    const configuration = { tx, rx, freqGhz, maxDepth, solverOptions, materials, phyOptions, scene: { buildingCount: buildings.length, geometryFingerprint: await sha256Json(buildings) } };
     try {
-      const job = await startPhyBerSweep(tx, rx, buildings, freqGhz, maxDepth, solverOptions, materials, {
-        mcsIndex: phyMcs, numPrb: phyPrb,
-        snrMinDb: phySnrMin, snrMaxDb: phySnrMax, snrStepDb: 2,
-        slotsPerPoint: phySlots,
+      const job = await startPhyBerSweep(tx, rx, buildings, freqGhz, maxDepth, solverOptions, materials, phyOptions);
+      const log = await safeCreateExperiment({
+        name: `NR PUSCH BER/BLER sweep · MCS ${phyMcs} · ${phyChannelMode}`, kind: 'phy_sweep', status: 'running',
+        startedAtUtc, seed: 42, configuration,
+        parameters: { ...phyOptions, maxDepth, pathSeed: solverOptions.pathSeed, pathSamplesPerSource: solverOptions.pathSamplesPerSource },
+        results: { jobId: job.jobId, status: 'running' },
+        replay: { endpoint: '/api/phyber', body: replayBody, description: 'Repeat NR PUSCH BER/BLER sweep' },
       });
+      setPhyExperimentId(log?.id ?? null);
       setPhyJobId(job.jobId);
+      setPhyMessage(job.message || 'Queued');
     } catch (e: any) {
-      setPhyError(e?.message || 'PHY sweep failed to start');
+      const errorText = e?.message || 'PHY sweep failed to start';
+      setPhyError(errorText);
+      await safeCreateExperiment({
+        name: `NR PUSCH BER/BLER sweep · MCS ${phyMcs} · ${phyChannelMode}`, kind: 'phy_sweep', status: 'error',
+        startedAtUtc, completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
+        seed: 42, configuration,
+        parameters: phyOptions, results: {}, error: errorText,
+        replay: { endpoint: '/api/phyber', body: replayBody, description: 'Retry NR PUSCH BER/BLER sweep' },
+      });
+    }
+  };
+
+  const cancelPhySweep = async () => {
+    if (!phyJobId) return;
+    try {
+      const status = await cancelPhyBerJob(phyJobId);
+      setPhyMessage(status.message || 'Cancellation requested');
+    } catch (error: any) {
+      setPhyError(error?.message || 'Could not cancel the PHY sweep');
     }
   };
 
@@ -123,21 +238,34 @@ export function AnalysisPanel({ tx, rx, paths, metrics, freqGhz, radioMap, build
 
   const runLinkKpi = async () => {
     const epoch = configEpoch.current;
+    const startedAtUtc = new Date().toISOString();
+    const started = performance.now();
+    const override = kpiSnrOverride.trim() === '' ? null : Number(kpiSnrOverride);
+    const kpiOptions = { numSubcarriers: kpiNumSc, subcarrierSpacing: kpiSpacingKhz * 1000, noiseFigureDb: kpiNoiseFigureDb, snrOverrideDb: override != null && Number.isFinite(override) ? override : null };
+    const replayBody = { tx, rx, buildings, freqGhz, maxDepth, options: solverOptions, materials, ...kpiOptions };
+    const configuration = { tx, rx, freqGhz, maxDepth, solverOptions, materials, kpiOptions, scene: { buildingCount: buildings.length, geometryFingerprint: await sha256Json(buildings) } };
+    let status: 'done' | 'error' = 'done';
+    let resultSummary: Record<string, unknown> = {};
+    let errorText: string | null = null;
     setKpiLoading(true);
     setKpiError('');
     try {
-      const override = kpiSnrOverride.trim() === '' ? null : Number(kpiSnrOverride);
-      const res = await solveLinkKpi(tx, rx, buildings, freqGhz, maxDepth, solverOptions, materials, {
-        numSubcarriers: kpiNumSc,
-        subcarrierSpacing: kpiSpacingKhz * 1000,
-        noiseFigureDb: kpiNoiseFigureDb,
-        snrOverrideDb: override != null && Number.isFinite(override) ? override : null,
-      });
+      const res = await solveLinkKpi(tx, rx, buildings, freqGhz, maxDepth, solverOptions, materials, kpiOptions);
       if (epoch === configEpoch.current) setKpi(res);
+      resultSummary = summarizeUnknownExperimentResult('link_kpi', res);
     } catch (e: any) {
-      if (epoch === configEpoch.current) setKpiError(e?.message || 'Link KPI solve failed');
+      status = 'error'; errorText = e?.message || 'Link KPI solve failed';
+      if (epoch === configEpoch.current) setKpiError(errorText);
     } finally {
       setKpiLoading(false);
+      await safeCreateExperiment({
+        name: `Link KPI · ${tx.name} → ${rx.name}`, kind: 'link_kpi', status,
+        startedAtUtc, completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
+        seed: solverOptions.pathSeed, configuration,
+        parameters: { ...kpiOptions, pathSeed: solverOptions.pathSeed, pathSamplesPerSource: solverOptions.pathSamplesPerSource },
+        results: resultSummary, error: errorText,
+        replay: { endpoint: '/api/linkkpi', body: replayBody, description: 'Repeat link-level Shannon KPI analysis' },
+      });
     }
   };
 
@@ -394,8 +522,8 @@ export function AnalysisPanel({ tx, rx, paths, metrics, freqGhz, radioMap, build
           </g>
         ))}
         <line x1="46" y1="14" x2="46" y2={chartH - 26} stroke="#e3e0d6" strokeWidth="1" />
-        <text x="46" y={chartH - 14} fontSize="7" fill="#6b6862" fontFamily="monospace">{minX.toFixed(0)} dB</text>
-        <text x={chartW - 60} y={chartH - 14} textAnchor="end" fontSize="7" fill="#6b6862" fontFamily="monospace">{maxX.toFixed(0)} dB (Eb/N0)</text>
+        <text x="46" y={chartH - 14} fontSize="7" fill="#6b6862" fontFamily="monospace">{minX.toFixed(1)} dB</text>
+        <text x={chartW - 60} y={chartH - 14} textAnchor="end" fontSize="7" fill="#6b6862" fontFamily="monospace">{maxX.toFixed(1)} dB ({r.channelMode === 'absolute' ? 'effective Eb/N0' : 'Eb/N0'})</text>
         <polyline fill="none" stroke="#4a727e" strokeWidth="2" points={line((p) => p.ber)} />
         <polyline fill="none" stroke="#cc785c" strokeWidth="2.5" points={line((p) => p.bler)} />
         {pts.map((p, i) => (
@@ -585,7 +713,7 @@ export function AnalysisPanel({ tx, rx, paths, metrics, freqGhz, radioMap, build
       {/* Link-level Shannon KPIs from the ray-traced CFR (backend /api/linkkpi) */}
       <div className="bg-[#f5f3ec] border border-[#e3e0d6] rounded p-4 flex flex-col gap-3">
         <h4 className="eyebrow flex items-center gap-1.5">
-          <Gauge className="w-3.5 h-3.5 text-[#4a727e]" /> Link-Level KPIs · Shannon Capacity (Ray-Traced CFR)
+          <Gauge className="w-3.5 h-3.5 text-[#4a727e]" /> Link-Level KPIs · Shannon Upper Bound (Ray-Traced CFR)
         </h4>
 
         <div className="flex flex-wrap items-end gap-3 text-[12px]">
@@ -632,8 +760,9 @@ export function AnalysisPanel({ tx, rx, paths, metrics, freqGhz, radioMap, build
         {!kpi && !kpiError && (
           <p className="text-[12px] text-slate-500 leading-relaxed">
             Re-traces the active Tx→Rx link, samples <code>paths.cfr()</code> on the OFDM grid and reduces it to
-            Shannon-capacity KPIs — open-loop vs beamformed capacity, spectral efficiency, spatial rank and
-            coherence bandwidth. Noise floor: thermal over the grid bandwidth + noise figure.
+            Idealized Shannon-capacity KPIs — open-loop vs beamformed capacity, spectral efficiency, spatial rank and
+            coherence bandwidth. The rate is an upper-bound reference, not scheduled NR throughput. Noise floor:
+            thermal over the grid bandwidth + noise figure.
           </p>
         )}
 
@@ -650,7 +779,7 @@ export function AnalysisPanel({ tx, rx, paths, metrics, freqGhz, radioMap, build
                 ['Open-loop capacity', kpi.capacityOpenLoopBitsHz.toFixed(2), 'bit/s/Hz'],
                 ['Steered-beam capacity', kpi.capacityUniformBitsHz.toFixed(2), 'bit/s/Hz'],
                 ['MRT bound', kpi.capacityBeamformedBitsHz.toFixed(2), 'bit/s/Hz'],
-                ['Throughput (open-loop)', kpi.throughputMbps.toFixed(1), `Mbps · ${(kpi.bandwidthHz / 1e6).toFixed(1)} MHz`],
+                ['Shannon rate upper bound', kpi.throughputMbps.toFixed(1), `Mbps · ${(kpi.bandwidthHz / 1e6).toFixed(1)} MHz`],
                 [kpi.snrSource === 'override' ? 'Operating SNR (override)' : 'Effective SNR (link budget)',
                   kpi.effectiveSnrDb == null ? '—' : kpi.effectiveSnrDb.toFixed(1), 'dB'],
                 ['Beamforming gain (MRT − steered)', kpi.beamformingGainDb == null ? '—' : kpi.beamformingGainDb.toFixed(2), 'dB'],
@@ -701,55 +830,154 @@ export function AnalysisPanel({ tx, rx, paths, metrics, freqGhz, radioMap, build
 
         <div className="flex flex-wrap items-end gap-3 text-[12px]">
           <label className="flex flex-col gap-1 text-slate-600 font-semibold">
-            MCS index
-            <NumberField
-              value={phyMcs}
-              integer
-              min={0}
-              max={27}
-              onChange={setPhyMcs}
-              className="w-16 bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800"
-            />
-          </label>
-          <label className="flex flex-col gap-1 text-slate-600 font-semibold">
-            PRBs
-            <select value={phyPrb} onChange={(e) => setPhyPrb(Number(e.target.value))}
-              className="bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800">
-              {[12, 24, 52, 106].map((n) => <option key={n} value={n}>{n}</option>)}
+            MCS table
+            <select value={phyMcsTable} onChange={(e) => {
+              const next = Number(e.target.value) as 1 | 2 | 3;
+              setPhyMcsTable(next);
+              setPhyMcs((current) => Math.min(current, next === 2 ? 27 : 28));
+            }} className="bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800">
+              <option value={1}>Table 1 · 64QAM</option>
+              <option value={2}>Table 2 · 256QAM</option>
+              <option value={3}>Table 3 · 64QAM low-SE</option>
             </select>
           </label>
           <label className="flex flex-col gap-1 text-slate-600 font-semibold">
-            Eb/N0 from (dB)
-            <NumberField
-              value={phySnrMin}
-              min={-40}
-              max={60}
-              onChange={setPhySnrMin}
-              className="w-16 bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800"
-            />
+            MCS index
+            <NumberField value={phyMcs} integer min={0} max={phyMcsTable === 2 ? 27 : 28}
+              onChange={setPhyMcs}
+              className="w-16 bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800" />
           </label>
           <label className="flex flex-col gap-1 text-slate-600 font-semibold">
-            to (dB)
-            <NumberField
-              value={phySnrMax}
-              min={-40}
-              max={60}
-              onChange={setPhySnrMax}
-              className="w-16 bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800"
-            />
+            Channel BW (MHz)
+            <select value={phyBandwidthMHz} onChange={(e) => setPhyBandwidthMHz(Number(e.target.value))}
+              className="bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800">
+              {phyBandwidthOptions.map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+            SCS (kHz)
+            <select value={phyScsKhz} onChange={(e) => {
+              const next = Number(e.target.value);
+              const allowed = Object.keys(FR1_PRB_TABLE[next] || {}).map(Number);
+              setPhyScsKhz(next);
+              if (!allowed.includes(phyBandwidthMHz)) {
+                setPhyBandwidthMHz(allowed.includes(20) ? 20 : allowed[0]);
+              }
+              if (next !== 60) setPhyCyclicPrefix('normal');
+            }} className="bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800">
+              {[15, 30, 60].map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+            PCI
+            <NumberField value={phyCellId} integer min={0} max={1007} onChange={setPhyCellId}
+              className="w-16 bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800" />
+          </label>
+          <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+            Cyclic prefix
+            <select value={phyCyclicPrefix} onChange={(e) => setPhyCyclicPrefix(e.target.value as 'normal' | 'extended')}
+              className="bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800">
+              <option value="normal">Normal</option>
+              <option value="extended" disabled={phyScsKhz !== 60}>Extended (60 kHz)</option>
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+            DMRS type
+            <select value={phyDmrsType} onChange={(e) => setPhyDmrsType(Number(e.target.value) as 1 | 2)}
+              className="bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800">
+              <option value={1}>Type 1</option>
+              <option value={2}>Type 2</option>
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+            DMRS additional position
+            <select value={phyDmrsAdditional} onChange={(e) => setPhyDmrsAdditional(Number(e.target.value) as 0 | 1 | 2 | 3)}
+              className="bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800">
+              {[0, 1, 2, 3].map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+            Channel mode
+            <select value={phyChannelMode} onChange={(e) => {
+              const next = e.target.value as 'normalized' | 'absolute';
+              setPhyChannelMode(next);
+              if (next === 'absolute') {
+                // Start near the expected transition while keeping 0 dB — the
+                // physical link-budget operating point — inside the sweep.
+                setPhySnrMin(-2);
+                setPhySnrMax(2);
+                setPhySnrStep(1);
+              } else {
+                setPhySnrMin(-10);
+                setPhySnrMax(14);
+                setPhySnrStep(1);
+              }
+              setPhyResult(null);
+              setPhyError('');
+            }} className="bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800">
+              <option value="normalized">Normalized Eb/N0</option>
+              <option value="absolute">Absolute link budget</option>
+            </select>
+          </label>
+          {phyChannelMode === 'absolute' && (
+            <>
+              <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+                UE Tx power (dBm)
+                <NumberField value={phyUeTxPowerDbm} min={-10} max={33} step={0.5} onChange={setPhyUeTxPowerDbm}
+                  className="w-20 bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800" />
+              </label>
+              <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+                BS Rx noise figure (dB)
+                <NumberField value={phyReceiverNoiseFigureDb} min={0} max={20} step={0.5} onChange={setPhyReceiverNoiseFigureDb}
+                  className="w-20 bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800" />
+              </label>
+            </>
+          )}
+          <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+            {phyChannelMode === 'absolute' ? 'Link offset from (dB)' : 'Eb/N0 from (dB)'}
+            <NumberField value={phySnrMin} min={-40} max={60} step={0.5} onChange={setPhySnrMin}
+              className="w-16 bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800" />
+          </label>
+          <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+            {phyChannelMode === 'absolute' ? 'Link offset to (dB)' : 'Eb/N0 to (dB)'}
+            <NumberField value={phySnrMax} min={-40} max={60} step={0.5} onChange={setPhySnrMax}
+              className="w-16 bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800" />
+          </label>
+          <label className="flex flex-col gap-1 text-slate-600 font-semibold">
+            Step (dB)
+            <select value={phySnrStep} onChange={(e) => setPhySnrStep(Number(e.target.value))}
+              className="bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800">
+              <option value={0.5}>0.5</option>
+              <option value={1}>1.0</option>
+              <option value={2}>2.0</option>
+            </select>
           </label>
           <label className="flex flex-col gap-1 text-slate-600 font-semibold">
             Slots/point
             <select value={phySlots} onChange={(e) => setPhySlots(Number(e.target.value))}
               className="bg-white border border-[#e3e0d6] rounded px-2 py-1 font-mono text-slate-800">
-              {[16, 32, 64, 128].map((n) => <option key={n} value={n}>{n}</option>)}
+              {[16, 32, 64, 128, 256, 512].map((n) => <option key={n} value={n}>{n}</option>)}
             </select>
           </label>
-          <button onClick={runPhySweep} disabled={!!phyJobId || !backendOnline || !phyAvailable}
+          <span className="text-[11px] text-slate-500 font-mono pb-1">
+            {phyPrb ? `${phyPrb} PRB · ${phyPrb * 12} subcarriers · ${(phyPrb * 12 * phyScsKhz / 1000).toFixed(2)} MHz occupied` : 'Invalid FR1 grid'}
+          </span>
+          <button onClick={runPhySweep} disabled={!!phyJobId || !backendOnline || !phyAvailable || !phyPrb || phySnrMax < phySnrMin || (phySnrMax - phySnrMin) / phySnrStep > 40 || Math.abs(((phySnrMax - phySnrMin) / phySnrStep) - Math.round((phySnrMax - phySnrMin) / phySnrStep)) > 1e-7}
             className="btn-signal text-[14px] py-1.5 px-3.5 cursor-pointer border-none disabled:opacity-50">
             {phyJobId ? 'Sweeping…' : 'Run BER Sweep'}
           </button>
+          {phyJobId && <button type="button" onClick={() => void cancelPhySweep()} className="inline-flex items-center gap-1 rounded border border-rose-300 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-800 hover:bg-rose-100"><Square className="h-3 w-3"/> Cancel sweep</button>}
         </div>
+
+        {phyChannelMode === 'absolute' ? (
+          <p className="text-[11px] text-slate-500 leading-relaxed">
+            Absolute mode keeps the unnormalized Sionna RT channel. UE conducted Tx power is assumed to be uniformly spread across the active PUSCH bandwidth; thermal noise uses 293 K, the selected BS receiver noise figure, and occupied bandwidth. A 0 dB link offset is the physical link-budget operating point; negative offsets add noise and positive offsets reduce it. This reciprocal PUSCH model does not yet include NR uplink power control, inter-cell interference, HARQ, or a scheduler.
+          </p>
+        ) : (
+          <p className="text-[11px] text-slate-500 leading-relaxed">
+            Normalized mode scales the ray-traced CFR to unit mean energy and sweeps the entered Eb/N0 values. It isolates multipath/frequency selectivity from absolute path loss. Choose a 0.5, 1, or 2 dB step to refine the waterfall curve.
+          </p>
+        )}
 
         {!phyAvailable && backendOnline && (
           <p className="text-[12px] text-slate-500">
@@ -770,17 +998,19 @@ export function AnalysisPanel({ tx, rx, paths, metrics, freqGhz, radioMap, build
 
         {!phyResult && !phyJobId && !phyError && phyAvailable && (
           <p className="text-[12px] text-slate-500 leading-relaxed">
-            Replays the ray-traced channel through the standard-compliant NR PUSCH chain — LDPC transport blocks,
-            QAM, DMRS-based estimation, LMMSE — as the reciprocal uplink (UE transmits, the base-station array receives).
-            The channel is normalized to unit mean energy, so Eb/N0 is relative to the received symbol energy.
+            {phyChannelMode === 'normalized'
+              ? 'Simulates a standards-based subset of NR FR1 PUSCH (LDPC transport blocks, QAM, DMRS, default Sionna LS channel estimation and LMMSE detection) on the reciprocal uplink. The FR1 bandwidth/SCS pair determines PRBs using the 3GPP TS 38.104 table. The ray-traced channel is normalized to unit mean energy: Eb/N0 excludes absolute path loss and this sweep includes AWGN only, not inter-cell interference.'
+              : 'Simulates reciprocal NR FR1 PUSCH with the unnormalized ray-traced channel. The physical reference point is derived from UE conducted power, mean RT channel gain, occupied bandwidth, 293 K thermal noise and BS receiver noise figure. The displayed baseline Eb/N0 is an approximate MCS-equivalent value; this mode does not yet include inter-cell interference, uplink power control, HARQ or a scheduler.'}
           </p>
         )}
 
         {phyResult && (
           <>
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] font-mono text-slate-600">
-              <span>MCS {phyResult.mcsIndex} · {phyResult.modulationOrder} bit/sym · r={phyResult.targetCoderate.toFixed(3)}</span>
-              <span>{phyResult.numPrb} PRB ({phyResult.numSubcarriers} sc)</span>
+              <span>{phyResult.channelMode === 'absolute' ? 'ABSOLUTE LINK BUDGET' : 'NORMALIZED CHANNEL'}</span>
+              <span>MCS table {phyResult.mcsTable} / index {phyResult.mcsIndex} · {phyResult.modulationOrder} bit/sym · r={phyResult.targetCoderate.toFixed(3)}</span>
+              <span>{phyResult.channelBandwidthMHz ?? 'Custom'} MHz · {phyResult.subcarrierSpacingHz / 1000} kHz · {phyResult.numPrb} PRB ({phyResult.numSubcarriers} sc)</span>
+              <span>PCI {phyResult.nCellId} · {phyResult.cyclicPrefix} CP · DMRS type {phyResult.dmrsConfigType} / +{phyResult.dmrsAdditionalPosition}</span>
               <span>
                 {phyResult.numRxAnt} BS ports ← {phyResult.numTxAnt} UE stream
                 {phyResult.numUeArrayPorts > 1 ? ` / ${phyResult.numUeArrayPorts} array ports` : ''}
@@ -789,8 +1019,44 @@ export function AnalysisPanel({ tx, rx, paths, metrics, freqGhz, radioMap, build
               <span>{phyResult.numPaths} paths</span>
               <span>{phyResult.slotsPerPoint} slots/pt</span>
             </div>
+            {phyResult.channelMode === 'absolute' && (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 rounded border border-[#d9e3df] bg-[#f0f5f2] p-3 text-[11px] font-mono">
+                <div><div className="text-slate-500">UE conducted power</div><strong>{phyResult.ueTxPowerDbm?.toFixed(1)} dBm</strong></div>
+                <div><div className="text-slate-500">Mean combined Rx signal power</div><strong>{phyResult.rxPowerDbm?.toFixed(1)} dBm</strong></div>
+                <div><div className="text-slate-500">Noise / BS branch</div><strong>{phyResult.noisePowerDbm?.toFixed(1)} dBm</strong></div>
+                <div><div className="text-slate-500">Noise bandwidth</div><strong>{((phyResult.noiseBandwidthHz ?? 0) / 1e6).toFixed(2)} MHz</strong></div>
+                <div><div className="text-slate-500">BS receiver NF</div><strong>{phyResult.receiverNoiseFigureDb?.toFixed(1)} dB</strong></div>
+                <div><div className="text-slate-500">Mean channel gain</div><strong>{phyResult.meanChannelGainDb?.toFixed(1)} dB</strong></div>
+                <div><div className="text-slate-500">Mean link-budget SNR reference</div><strong>{phyResult.effectiveSnrDb?.toFixed(2)} dB</strong></div>
+                <div><div className="text-slate-500">Approx. link-budget Eb/N0</div><strong>{phyResult.linkBudgetEbNoDb?.toFixed(2)} dB</strong></div>
+              </div>
+            )}
             {renderBerChart(phyResult)}
-            <span className="text-[11px] text-slate-400 font-mono">Open markers: no errors observed (below 1e-6).</span>
+            <div className="text-[11px] text-slate-500 font-mono">
+              Max excess delay {phyResult.maxExcessDelayNs.toFixed(1)} ns · approximate minimum CP {phyResult.approxMinimumCpNs.toFixed(1)} ns
+              {phyResult.maxExcessDelayNs > phyResult.approxMinimumCpNs && (
+                <span className="text-[#b45309]"> · Warning: excess delay may exceed the cyclic prefix; the frequency-domain model does not simulate resulting ISI/ICI.</span>
+              )}
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px] font-mono border-collapse">
+                <thead><tr className="text-slate-500 border-b border-[#e3e0d6]">
+                  <th className="text-left py-1.5 pr-2">Eb/N0</th><th className="text-right py-1.5 px-2">BER [95% CI]</th>
+                  {phyResult.channelMode === 'absolute' && <th className="text-right py-1.5 px-2">Link offset</th>}
+                  <th className="text-right py-1.5 px-2">BLER [95% CI]</th><th className="text-right py-1.5 pl-2">Goodput</th>
+                </tr></thead>
+                <tbody>{phyResult.points.map((p) => (
+                  <tr key={p.ebNoDb} className="border-b border-[#eeeae1] text-slate-700">
+                    <td className="py-1.5 pr-2">{p.ebNoDb.toFixed(2)} dB</td>
+                    <td className="text-right py-1.5 px-2">{p.ber.toExponential(2)} [{p.berCi95Lower.toExponential(1)}, {p.berCi95Upper.toExponential(1)}]</td>
+                    {phyResult.channelMode === 'absolute' && <td className="text-right py-1.5 px-2">{(p.linkBudgetOffsetDb ?? 0) > 0 ? '+' : ''}{(p.linkBudgetOffsetDb ?? 0).toFixed(1)} dB</td>}
+                    <td className="text-right py-1.5 px-2">{p.bler.toExponential(2)} [{p.blerCi95Lower.toExponential(1)}, {p.blerCi95Upper.toExponential(1)}]</td>
+                    <td className="text-right py-1.5 pl-2">{p.goodputMbps.toFixed(2)} Mbps</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+            <span className="text-[11px] text-slate-400 font-mono">BER/BLER intervals are Wilson 95% score intervals. Goodput is empirical decoded TB bits per simulated slot duration for this single UE link; it excludes scheduler, HARQ, control and core-network overhead. Open chart markers indicate no observed errors in the finite sample.</span>
           </>
         )}
       </div>

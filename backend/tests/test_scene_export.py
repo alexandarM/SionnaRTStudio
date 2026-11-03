@@ -5,6 +5,9 @@ Mitsuba scene itself needs a real scene build.
 
 Run with:  .venv/bin/python -m unittest discover backend/tests
 """
+# Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+# Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -164,7 +167,7 @@ class TestGeneratedScript(unittest.TestCase):
         self.assertIn("CHANNEL_GROUPS = []", script)
         self.assertNotIn("tx_placeholder", script)
         self.assertNotIn("rx_placeholder", script)
-        self.assertIn("No CIR/CFR generated", script)
+        self.assertIn("No CIR/CFR was generated", script)
 
     def test_one_sided_device_scene_skips_solver_without_fake_counterpart(self):
         script = _load_scene_script(_request(rxs=None))

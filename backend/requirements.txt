@@ -1,3 +1,6 @@
+# Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+# Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 # Real ray-tracing backend. Requires an NVIDIA GPU + CUDA for Sionna/Mitsuba.
 sionna-rt==2.0.1
 mitsuba==3.8.0
@@ -17,3 +20,6 @@ numpy>=2.3.2; python_version >= "3.14"
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
+
+# EPSG:4326 -> EPSG:32634 metric coordinate audit/export.
+pyproj>=3.6,<4

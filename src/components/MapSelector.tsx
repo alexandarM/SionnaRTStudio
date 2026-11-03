@@ -1,3 +1,6 @@
+// Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+// Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -79,8 +82,20 @@ export function MapSelector({
   rxRef.current = rx;
   // User-chosen square selection size in meters (the chunk of map to fetch).
   const [boxSizeM, setBoxSizeM] = useState(400);
+  const [boxSizeDraft, setBoxSizeDraft] = useState('400');
   const boxSizeRef = useRef(boxSizeM);
   boxSizeRef.current = boxSizeM;
+
+  const commitBoxSize = (rawValue: string) => {
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed) || parsed < 100) {
+      setBoxSizeDraft(String(boxSizeM));
+      return;
+    }
+    const nextSize = Math.round(parsed);
+    setBoxSizeM(nextSize);
+    setBoxSizeDraft(String(nextSize));
+  };
 
   // Square bounding box of `boxSizeM` meters centred on the anchor.
   const computeBbox = (lat: number, lon: number, sizeM: number = boxSizeRef.current) => {
@@ -207,7 +222,7 @@ export function MapSelector({
     }
 
     // Frame the selection: fit the box (with padding) so resizing is visible.
-    mapRef.current.fitBounds(bounds, { padding: [24, 24], animate: true });
+    mapRef.current.fitBounds(bounds, { padding: [24, 24], animate: boxSizeM < 5_000 });
   }, [anchor, boxSizeM]);
 
   // Handle marker position changes on external props updates (e.g., from 3D dragging)
@@ -382,21 +397,50 @@ export function MapSelector({
         {/* Selection size — choose how big a chunk of the map to capture */}
         <div className="flex flex-col gap-1 pt-1">
           <div className="flex justify-between items-center">
-            <label className="eyebrow">Selection Size</label>
-            <span className="font-mono text-[13px] text-[#cc785c] font-bold">{boxSizeM} m</span>
+            <label htmlFor="selection-size-m" className="eyebrow">Selection Size (metres)</label>
+            <span className="font-mono text-[12px] text-[#cc785c] font-bold">
+              {((boxSizeM / 1000) ** 2).toLocaleString(undefined, { maximumFractionDigits: 2 })} km²
+            </span>
           </div>
           <input
-            type="range"
-            id="slider-box-size"
+            type="number"
+            id="selection-size-m"
+            inputMode="numeric"
             min="100"
-            max="2000"
             step="50"
-            className="accent-[#cc785c] cursor-ew-resize w-full"
-            value={boxSizeM}
-            onChange={(e) => setBoxSizeM(parseInt(e.target.value, 10))}
+            className="w-full bg-white border border-[#e3e0d6] rounded px-2.5 py-2 text-[14px] font-mono font-semibold text-slate-900 focus:outline-none focus:border-[#cc785c]"
+            value={boxSizeDraft}
+            onChange={(e) => setBoxSizeDraft(e.target.value)}
+            onBlur={() => commitBoxSize(boxSizeDraft)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                commitBoxSize(boxSizeDraft);
+                (e.currentTarget as HTMLInputElement).blur();
+              }
+            }}
+            aria-describedby="selection-size-help"
           />
-          <span className="text-[11px] text-slate-600 font-mono">
-            Click the map to recenter · drag the slider to resize the fetch area
+          <div className="flex flex-wrap gap-1.5">
+            {[500, 1_000, 2_000, 5_000, 10_000].map((size) => (
+              <button
+                key={size}
+                type="button"
+                onClick={() => {
+                  setBoxSizeM(size);
+                  setBoxSizeDraft(String(size));
+                }}
+                className={`px-2 py-1 rounded border text-[11px] font-mono transition ${
+                  boxSizeM === size
+                    ? 'border-[#cc785c] bg-[#cc785c]/10 text-[#9e543e]'
+                    : 'border-[#e3e0d6] bg-white text-slate-600 hover:border-[#cc785c]'
+                }`}
+              >
+                {size >= 1_000 ? `${size / 1_000} km` : `${size} m`}
+              </button>
+            ))}
+          </div>
+          <span id="selection-size-help" className="text-[11px] text-slate-600 font-mono">
+            No fixed upper size limit. Large selections are fetched as smaller Overpass tiles. Click the map to recenter.
           </span>
         </div>
 
@@ -425,12 +469,12 @@ export function MapSelector({
           </button>
         </div>
 
-        {isLoading && (
-          <div className="mt-2 p-2.5 bg-[#ebe7dc] text-[#cc785c] text-[12px] font-mono border border-[#e3e0d6] rounded flex flex-col gap-1.5 animate-pulse">
+        {(isLoading || downloadProgress) && (
+          <div className={`mt-2 p-2.5 bg-[#ebe7dc] text-[#cc785c] text-[12px] font-mono border border-[#e3e0d6] rounded flex flex-col gap-1.5 ${isLoading ? 'animate-pulse' : ''}`} role="status" aria-live="polite">
             <span>{downloadProgress || 'Retrieving structures footprint from Overpass...'}</span>
-            <div className="w-full bg-[#f5f3ec] h-1 rounded overflow-hidden">
+            {isLoading && <div className="w-full bg-[#f5f3ec] h-1 rounded overflow-hidden">
               <span className="block h-full bg-[#cc785c] animate-pulse" style={{ width: '40%' }} />
-            </div>
+            </div>}
           </div>
         )}
       </div>

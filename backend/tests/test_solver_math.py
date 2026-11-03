@@ -2,6 +2,9 @@
 
 Run with:  .venv/bin/python -m unittest discover backend/tests
 """
+# Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+# Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 import math
 import unittest
 
@@ -17,6 +20,7 @@ from backend.solver import (
     _channel_metrics,
     _coverage_stats,
     _default_threshold,
+    _device_z,
     _empty_metrics,
     _mobility_step,
     _notebook_tau_shape,
@@ -54,6 +58,33 @@ class TestAzEl(unittest.TestCase):
 
     def test_nan_angles_return_none(self):
         self.assertEqual(_az_el(float("nan"), 0.0), (None, None))
+
+
+class TestImportedTransmitterHeightReference(unittest.TestCase):
+    def setUp(self):
+        self.enu = ENUVector(x=10.0, y=20.0, z=0.0)
+        self.buildings = [BuildingFootprint(
+            id="roof", enuPoints=[
+                ENUVector(x=0, y=0, z=0), ENUVector(x=30, y=0, z=0),
+                ENUVector(x=30, y=40, z=0), ENUVector(x=0, y=40, z=0),
+            ], height=18.0, category="building", material="itu_concrete", type="office",
+        )]
+
+    def test_agl_is_not_added_to_roof_height(self):
+        self.assertAlmostEqual(_device_z(self.enu, 31.8, self.buildings, "agl"), 31.8)
+
+    def test_absolute_scene_z_is_used_directly(self):
+        self.assertAlmostEqual(_device_z(self.enu, 31.8, self.buildings, "scene_z"), 31.8)
+
+    def test_above_roof_adds_building_height(self):
+        self.assertAlmostEqual(_device_z(self.enu, 4.0, self.buildings, "roof"), 22.0)
+
+    def test_legacy_missing_reference_retains_roof_plus_height(self):
+        self.assertAlmostEqual(_device_z(self.enu, 4.0, self.buildings), 22.0)
+
+    def test_unknown_reference_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported transmitter heightReference"):
+            _device_z(self.enu, 4.0, self.buildings, "unknown")
 
 
 class TestBeamTarget(unittest.TestCase):

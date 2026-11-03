@@ -1,3 +1,6 @@
+// Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+// Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -8,23 +11,60 @@
 
 import { GeoAnchor, ENUVector, BuildingFootprint, Transmitter, PropagationPath, RadioMapGrid, ChannelGridConfig } from './types';
 
-// Coordinate Math Constants
-const M_LAT = 110574;
+// WGS84 local tangent-plane scale at the scene anchor. The scene's horizontal
+// coordinates are local ENU metres; using the ellipsoid's meridional and
+// prime-vertical radii is more accurate than a fixed metres-per-degree
+// approximation while keeping the existing local-scene coordinate contract.
+const WGS84_A = 6378137.0;
+const WGS84_F = 1 / 298.257223563;
+const WGS84_E2 = WGS84_F * (2 - WGS84_F);
+
+function wgs84LocalRadii(latitudeDeg: number): { meridional: number; primeVertical: number; cosLatitude: number } {
+  const latitudeRad = (latitudeDeg * Math.PI) / 180;
+  const sinLatitude = Math.sin(latitudeRad);
+  const denominator = Math.sqrt(1 - WGS84_E2 * sinLatitude * sinLatitude);
+  const primeVertical = WGS84_A / denominator;
+  const meridional = WGS84_A * (1 - WGS84_E2) / (denominator ** 3);
+  return { meridional, primeVertical, cosLatitude: Math.cos(latitudeRad) };
+}
 
 export function latLonToENU(lat: number, lon: number, anchor: GeoAnchor): ENUVector {
-  const latRefRad = (anchor.latitude * Math.PI) / 180;
-  const mLon = Math.cos(latRefRad) * 111320;
-  const x = (lon - anchor.longitude) * mLon;
-  const y = (lat - anchor.latitude) * M_LAT;
+  const radii = wgs84LocalRadii(anchor.latitude);
+  const deltaLongitudeRad = ((lon - anchor.longitude) * Math.PI) / 180;
+  const deltaLatitudeRad = ((lat - anchor.latitude) * Math.PI) / 180;
+  const x = deltaLongitudeRad * radii.primeVertical * radii.cosLatitude;
+  const y = deltaLatitudeRad * radii.meridional;
   return { x, y, z: 0 };
 }
 
 export function enuToLatLon(enu: ENUVector, anchor: GeoAnchor): { lat: number; lon: number } {
-  const latRefRad = (anchor.latitude * Math.PI) / 180;
-  const mLon = Math.cos(latRefRad) * 111320;
-  const lon = anchor.longitude + enu.x / mLon;
-  const lat = anchor.latitude + enu.y / M_LAT;
+  const radii = wgs84LocalRadii(anchor.latitude);
+  const longitudeScale = radii.primeVertical * radii.cosLatitude;
+  if (Math.abs(longitudeScale) < 1e-6) {
+    throw new RangeError('ENU longitude conversion is undefined at the geographic poles.');
+  }
+  const lon = anchor.longitude + (enu.x / longitudeScale) * (180 / Math.PI);
+  const lat = anchor.latitude + (enu.y / radii.meridional) * (180 / Math.PI);
   return { lat, lon };
+}
+
+/** Stable categorical sector hue shared by 2D/3D association views. */
+export function getSectorHue(txIndex: number, stableId?: string): number {
+  if (stableId) {
+    // FNV-1a provides a stable hue when TX order changes (e.g. band filtering).
+    let hash = 2166136261;
+    for (let index = 0; index < stableId.length; index += 1) {
+      hash ^= stableId.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0) / 4294967296;
+  }
+  return (Math.max(0, txIndex) * 0.618033988749895) % 1;
+}
+
+export function getSectorColorCss(txIndex: number, stableId?: string): string {
+  const hue = getSectorHue(txIndex, stableId) * 360;
+  return `hsl(${hue.toFixed(1)}, 68%, 52%)`;
 }
 
 // 2D point-in-polygon test (ray casting) against a building footprint.
@@ -173,23 +213,73 @@ export interface OsmBounds {
 
 export interface OverpassData {
   elements?: any[];
+  /** Upstream instance selected by the same-origin backend proxy. */
+  source?: string;
 }
 
-// Overpass mirrors, tried in order. Both serve the full planet — a regional
-// extract (e.g. overpass.osm.ch, Switzerland only) must never go in this list:
-// it answers 200 with an empty `elements` array outside its region, which reads
-// as "no buildings here" rather than as a failure.
-//
-// A mirror that accepts the connection and then goes silent is the failure mode
-// that matters, so every request below is bounded by OSM_FETCH_TIMEOUT_MS.
+// Kept for the scene-freezer/reproducibility scripts. Browser requests do not
+// contact these providers directly: /api/osm/query proxies them server-side,
+// so Colab/browser CORS policy and custom User-Agent restrictions are avoided.
 export const OSM_OVERPASS_ENDPOINTS = [
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
   'https://overpass-api.de/api/interpreter',
-  'https://z.overpass-api.de/api/interpreter',
 ] as const;
 
-/** Per-mirror ceiling. Overpass runs the query under `[out:json][timeout:25]`,
- *  so a healthy-but-busy server still fits; past this it is not coming back. */
-export const OSM_FETCH_TIMEOUT_MS = 30_000;
+/**
+ * The same-origin backend tries the public providers sequentially. Budget for
+ * three provider attempts while keeping the server-side query timeout lower.
+ */
+export const OSM_FETCH_TIMEOUT_MS = 210_000;
+export const OSM_QUERY_TIMEOUT_SECONDS = 45;
+
+/**
+ * Per-query target, not a maximum user selection. A 2 km user selection should
+ * normally stay one request despite small geographic/projection rounding;
+ * 2.5 km tiles reduce unnecessary query count for city selections.
+ */
+export const OSM_TILE_SIZE_METERS = 2_500;
+const OSM_MIN_ADAPTIVE_TILE_SIZE_METERS = 500;
+const OSM_MAX_ADAPTIVE_SUBDIVISION_DEPTH = 2;
+const OSM_RATE_LIMIT_RETRY_MS = 30_000;
+const OSM_MAX_RATE_LIMIT_RETRIES = 1;
+const OSM_CAPACITY_RETRY_MS = 15_000;
+const OSM_MAX_CAPACITY_RETRIES = 1;
+
+class OsmOverpassRequestError extends Error {
+  constructor(
+    message: string,
+    readonly kind: 'rate-limit' | 'capacity' | 'query-resource' | 'network' | 'fatal',
+    readonly retryAfterMs = 0,
+  ) {
+    super(message);
+    this.name = 'OsmOverpassRequestError';
+  }
+}
+
+class OsmOverpassTileError extends Error {
+  constructor(
+    message: string,
+    readonly kind: OsmOverpassRequestError['kind'],
+    readonly retryAfterMs: number,
+    readonly shouldSubdivide: boolean,
+  ) {
+    super(message);
+    this.name = 'OsmOverpassTileError';
+  }
+}
+
+function parseRetryAfterMs(value: string | null): number {
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const dateMs = Date.parse(value);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : 0;
+}
+
+function delay(ms: number): Promise<void> {
+  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+}
 
 interface OsmClassification {
   category: BuildingFootprint['category'];
@@ -282,8 +372,11 @@ function stitchRings(ways: number[][]): number[][] {
   return rings;
 }
 
-/** Build the exact Overpass query used by both the browser and paper freezer. */
-export function buildOsmOverpassQuery(bounds: OsmBounds, timeoutSeconds = 25): string {
+/** Build the Overpass query used by the scene freezer; kept equivalent to backend/osm_proxy.py. */
+export function buildOsmOverpassQuery(
+  bounds: OsmBounds,
+  timeoutSeconds = OSM_QUERY_TIMEOUT_SECONDS,
+): string {
   const { south, west, north, east } = bounds;
   return `[out:json][timeout:${timeoutSeconds}];
 (
@@ -299,6 +392,244 @@ out body;
 out skel qt;`;
 }
 
+/** Split an arbitrary valid geographic selection into Overpass-sized tiles. */
+export function splitOsmBounds(
+  bounds: OsmBounds,
+  maxTileSizeMeters = OSM_TILE_SIZE_METERS,
+): OsmBounds[] {
+  const { south, west, north, east } = bounds;
+  if (![south, west, north, east, maxTileSizeMeters].every(Number.isFinite)) {
+    throw new Error('OSM selection contains a non-finite coordinate or tile size.');
+  }
+  if (south < -90 || north > 90 || south >= north || west < -180 || east > 180 || west >= east) {
+    throw new Error(
+      'OSM selection is outside valid geographic bounds or crosses the date line. Move the anchor or reduce the selection.',
+    );
+  }
+  if (maxTileSizeMeters <= 0) throw new Error('OSM tile size must be greater than zero.');
+
+  const latitudeMetersPerDegree = 110_574;
+  const latitudeSpanMeters = (north - south) * latitudeMetersPerDegree;
+  const rows = Math.max(1, Math.ceil(latitudeSpanMeters / maxTileSizeMeters));
+  const tiles: OsmBounds[] = [];
+
+  for (let row = 0; row < rows; row++) {
+    const tileSouth = south + ((north - south) * row) / rows;
+    const tileNorth = south + ((north - south) * (row + 1)) / rows;
+    const middleLatitude = (tileSouth + tileNorth) / 2;
+    const longitudeMetersPerDegree = 111_320 * Math.max(
+      Math.cos((middleLatitude * Math.PI) / 180),
+      1e-4,
+    );
+    const longitudeSpanMeters = (east - west) * longitudeMetersPerDegree;
+    const columns = Math.max(1, Math.ceil(longitudeSpanMeters / maxTileSizeMeters));
+
+    for (let column = 0; column < columns; column++) {
+      tiles.push({
+        south: tileSouth,
+        west: west + ((east - west) * column) / columns,
+        north: tileNorth,
+        east: west + ((east - west) * (column + 1)) / columns,
+      });
+    }
+  }
+
+  return tiles;
+}
+
+/**
+ * Merge tiled Overpass responses by element identity. Ways/relations can be
+ * returned by more than one tile; merging first is essential because relation
+ * outer rings need their member ways and node coordinates in one parser pass.
+ */
+export function mergeOverpassResponses(responses: OverpassData[]): OverpassData {
+  const elementsById = new Map<string, any>();
+  for (const response of responses) {
+    for (const element of response.elements ?? []) {
+      if (element?.type == null || element?.id == null) continue;
+      const key = `${element.type}/${element.id}`;
+      const previous = elementsById.get(key);
+      if (!previous) {
+        elementsById.set(key, element);
+        continue;
+      }
+
+      const merged = { ...previous, ...element };
+      if (previous.tags || element.tags) {
+        merged.tags = { ...(previous.tags ?? {}), ...(element.tags ?? {}) };
+      }
+      if (Array.isArray(previous.nodes) || Array.isArray(element.nodes)) {
+        const previousNodes = previous.nodes ?? [];
+        const nextNodes = element.nodes ?? [];
+        merged.nodes = nextNodes.length >= previousNodes.length ? nextNodes : previousNodes;
+      }
+      if (Array.isArray(previous.members) || Array.isArray(element.members)) {
+        const membersById = new Map<string, any>();
+        for (const member of [...(previous.members ?? []), ...(element.members ?? [])]) {
+          const memberKey = member?.type != null && member?.ref != null
+            ? `${member.type}/${member.ref}/${member.role ?? ''}`
+            : JSON.stringify(member);
+          membersById.set(memberKey, member);
+        }
+        merged.members = [...membersById.values()];
+      }
+      elementsById.set(key, merged);
+    }
+  }
+  return { elements: [...elementsById.values()] };
+}
+
+async function requestOsmBackendProxy(tile: OsmBounds): Promise<OverpassData> {
+  try {
+    return await withRequestTimeout(OSM_FETCH_TIMEOUT_MS, async (signal) => {
+      const response = await fetch('/api/osm/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(tile),
+        signal,
+      });
+      const body = await response.text();
+      let payload: any;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        throw new OsmOverpassRequestError(
+          `OSM backend proxy returned non-JSON content (${body.replace(/\s+/g, ' ').slice(0, 180)})`,
+          'network',
+        );
+      }
+
+      if (!response.ok) {
+        const detail = payload?.detail;
+        const message = typeof detail === 'string'
+          ? detail
+          : detail?.message || `OSM backend proxy returned HTTP ${response.status}`;
+        const allowedKinds = ['rate-limit', 'capacity', 'query-resource', 'network', 'fatal'] as const;
+        const kind = allowedKinds.includes(detail?.kind) ? detail.kind : (
+          response.status === 429 || response.status === 406 ? 'rate-limit'
+            : response.status === 413 ? 'query-resource'
+              : response.status === 400 ? 'fatal'
+                : response.status >= 500 ? 'capacity' : 'network'
+        );
+        throw new OsmOverpassRequestError(
+          message,
+          kind,
+          parseRetryAfterMs(response.headers.get('Retry-After')),
+        );
+      }
+
+      if (payload?.remark) {
+        const remark = String(payload.remark).replace(/\s+/g, ' ').slice(0, 400);
+        const isResourceFailure = /timed? ?out|timeout|out of memory|memory exhausted|runtime error/i.test(remark);
+        throw new OsmOverpassRequestError(
+          `Overpass query remark: ${remark}`,
+          isResourceFailure ? 'query-resource' : 'network',
+        );
+      }
+      if (!Array.isArray(payload?.elements)) {
+        throw new OsmOverpassRequestError(
+          'OSM backend proxy response does not contain an elements array.',
+          'network',
+        );
+      }
+      return payload as OverpassData;
+    });
+  } catch (error) {
+    if (error instanceof OsmOverpassRequestError) throw error;
+    if (error instanceof RequestTimeoutError) {
+      // This is a provider/backend availability timeout, not proof that the
+      // query itself is too large. Do not recursively subdivide on this alone.
+      throw new OsmOverpassRequestError(error.message, 'capacity');
+    }
+    throw new OsmOverpassRequestError(
+      error instanceof Error ? error.message : String(error),
+      'network',
+    );
+  }
+}
+
+async function fetchOsmTile(
+  tile: OsmBounds,
+  tileLabel: string,
+  onProgress: ((message: string) => void) | undefined,
+): Promise<OverpassData> {
+  try {
+    const data = await requestOsmBackendProxy(tile);
+    onProgress?.(`${tileLabel}: downloaded via ${data.source ?? 'backend Overpass proxy'} · ${(data.elements ?? []).length.toLocaleString()} raw elements...`);
+    return data;
+  } catch (error) {
+    const requestError = error instanceof OsmOverpassRequestError
+      ? error
+      : new OsmOverpassRequestError(error instanceof Error ? error.message : String(error), 'network');
+    const shouldSubdivide = requestError.kind === 'query-resource';
+    throw new OsmOverpassTileError(
+      `${tileLabel}: ${requestError.message}`,
+      requestError.kind,
+      requestError.retryAfterMs,
+      shouldSubdivide,
+    );
+  }
+}
+
+async function fetchOsmTileWithRecovery(
+  tile: OsmBounds,
+  tileLabel: string,
+  onProgress: ((message: string) => void) | undefined,
+  subdivisionDepth = 0,
+  rateLimitRetries = 0,
+  capacityRetries = 0,
+): Promise<OverpassData> {
+  try {
+    return await fetchOsmTile(tile, tileLabel, onProgress);
+  } catch (error) {
+    if (!(error instanceof OsmOverpassTileError)) throw error;
+
+    if (error.kind === 'rate-limit' && rateLimitRetries < OSM_MAX_RATE_LIMIT_RETRIES) {
+      const waitMs = Math.max(OSM_RATE_LIMIT_RETRY_MS, error.retryAfterMs);
+      onProgress?.(`${tileLabel}: all available Overpass providers are rate-limiting this request. Waiting ${Math.ceil(waitMs / 1_000)}s before one retry...`);
+      await delay(waitMs);
+      return fetchOsmTileWithRecovery(
+        tile, tileLabel, onProgress, subdivisionDepth,
+        rateLimitRetries + 1, capacityRetries,
+      );
+    }
+
+    if (error.kind === 'capacity' && capacityRetries < OSM_MAX_CAPACITY_RETRIES) {
+      onProgress?.(`${tileLabel}: public Overpass providers are busy. Waiting ${OSM_CAPACITY_RETRY_MS / 1_000}s and retrying the same tile (without creating more requests)...`);
+      await delay(OSM_CAPACITY_RETRY_MS);
+      return fetchOsmTileWithRecovery(
+        tile, tileLabel, onProgress, subdivisionDepth,
+        rateLimitRetries, capacityRetries + 1,
+      );
+    }
+
+    // Subdivision is reserved for explicit query-resource diagnostics from
+    // Overpass (e.g. query timed out / memory exhausted), never generic 502/503,
+    // provider busy responses, or client-side network timeouts.
+    if (error.shouldSubdivide && subdivisionDepth < OSM_MAX_ADAPTIVE_SUBDIVISION_DEPTH) {
+      const targetSize = Math.max(
+        OSM_MIN_ADAPTIVE_TILE_SIZE_METERS,
+        OSM_TILE_SIZE_METERS / (2 ** (subdivisionDepth + 1)),
+      );
+      const children = splitOsmBounds(tile, targetSize);
+      if (children.length > 1) {
+        onProgress?.(`${tileLabel}: Overpass explicitly reported a query resource limit; splitting this tile into ${children.length} smaller tiles...`);
+        const childResponses: OverpassData[] = [];
+        // Sequential requests protect shared public Overpass infrastructure.
+        for (let childIndex = 0; childIndex < children.length; childIndex++) {
+          childResponses.push(await fetchOsmTileWithRecovery(
+            children[childIndex], `${tileLabel}.${childIndex + 1}/${children.length}`,
+            onProgress, subdivisionDepth + 1, 0, 0,
+          ));
+        }
+        return mergeOverpassResponses(childResponses);
+      }
+    }
+
+    throw new Error(error.message);
+  }
+}
+
 export async function fetchOSMBuildings(
   south: number,
   west: number,
@@ -308,36 +639,35 @@ export async function fetchOSMBuildings(
   onProgress?: (message: string) => void,
 ): Promise<BuildingFootprint[]> {
   const bounds = { south, west, north, east };
-  const query = buildOsmOverpassQuery(bounds);
+  const tiles = splitOsmBounds(bounds);
+  const responses: OverpassData[] = [];
+  let receivedElements = 0;
 
-  let lastError = 'no Overpass endpoint responded';
-  for (const [index, endpoint] of OSM_OVERPASS_ENDPOINTS.entries()) {
-    const host = new URL(endpoint).host;
-    onProgress?.(
-      `Querying Overpass (mirror ${index + 1} of ${OSM_OVERPASS_ENDPOINTS.length}: ${host})...`,
+  onProgress?.(
+    tiles.length === 1
+      ? 'Downloading OSM data from the global Overpass service...'
+      : `Large selection detected: downloading ${tiles.length} OSM tiles sequentially through the backend proxy; only explicit Overpass query-resource errors trigger subdivision...`,
+  );
+
+  // Browser requests are sequential. The FastAPI proxy serializes each
+  // upstream request, applies provider failover, and remembers the last healthy
+  // provider for subsequent tiles.
+  for (let tileIndex = 0; tileIndex < tiles.length; tileIndex++) {
+    const response = await fetchOsmTileWithRecovery(
+      tiles[tileIndex], `OSM tile ${tileIndex + 1}/${tiles.length}`,
+      onProgress,
     );
-    try {
-      // Timeout spans the body read too — a mirror can accept the POST and then
-      // never answer, which is what used to wedge the download indefinitely.
-      const data = await withRequestTimeout(OSM_FETCH_TIMEOUT_MS, async (signal) => {
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-          body: new URLSearchParams({ data: query }),
-          signal,
-        });
-        if (!response.ok) {
-          throw new Error(`${response.status} ${response.statusText}`);
-        }
-        return await response.json() as OverpassData;
-      });
-      return parseOsmElements(data, bounds, anchor);
-    } catch (error) {
-      lastError = `${host}: ${error instanceof Error ? error.message : String(error)}`;
-      onProgress?.(`Mirror ${host} failed (${lastError}); trying the next one...`);
-    }
+    responses.push(response);
+    receivedElements += response.elements?.length ?? 0;
+    onProgress?.(
+      `Downloaded OSM tiles ${tileIndex + 1}/${tiles.length} · ${receivedElements.toLocaleString()} raw elements received...`,
+    );
   }
-  throw new Error(`Failed to fetch OSM data from configured Overpass mirrors (${lastError})`);
+
+  onProgress?.(`Merging duplicate OSM elements from ${tiles.length} tiles...`);
+  const mergedData = mergeOverpassResponses(responses);
+  onProgress?.(`Parsing ${mergedData.elements?.length.toLocaleString() ?? 0} unique OSM elements...`);
+  return parseOsmElements(mergedData, bounds, anchor);
 }
 
 /**
@@ -453,7 +783,8 @@ export function exportCoverageChannelGrid(
       schema: 'sionna_rt_studio_channel_grid_v1',
       dataset_kind: 'coverage_power_proxy',
       source_metric: grid.metric ?? 'power',
-      h_model: 'magnitude = best-server coverage power; phase = deterministic f(cell x,y). Not Sionna paths.cfr().',
+      h_model: 'magnitude = best-server coverage power; phase = deterministic f(cell x,y). LOS is unknown unless separately supplied. Not Sionna paths.cfr().',
+      los_status_source: 'unknown_not_exposed_by_sionna_radio_map_solver',
       antenna_configuration: {
         tx_array: tx.antennaArraySize,
         // RadioMapSolver uses its documented ideal dual-polarized isotropic
@@ -486,7 +817,7 @@ export function exportCoverageChannelGrid(
       return {
         receiver_index: idx,
         coordinate_enu_m: [cell.x, cell.y, cell.z],
-        los_status: cell.isLos ? 1 : 0, // geometric LOS approximation, not an RT output
+        los_status: cell.isLos == null ? null : (cell.isLos ? 1 : 0), // null = not provided; not mislabelled as NLOS
         received_power_dbm: cell.powerDbm,
         h_matrix: subcarriers_data,
       };

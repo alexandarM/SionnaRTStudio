@@ -1,3 +1,6 @@
+# Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.
+# Upstream: https://github.com/puloktarafder/SionnaRTStudio
+
 node_modules/
 .node/
 .venv/
@@ -15,3 +18,14 @@ artifacts/osm-scene/
 
 # Manuscript working directory (not part of the tool release).
 cleaned_manuscript/
+
+# Persistent runtime experiment database (created on first backend startup).
+/data/
+
+# Python testing and linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
