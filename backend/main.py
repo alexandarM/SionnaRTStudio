@@ -101,6 +101,7 @@ if not (mi.variant() or "").startswith("cuda"):
     )
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
@@ -114,6 +115,7 @@ from .models import (
     LinkKpiRequest,
     LinkKpiResponse,
     MobilityRequest,
+    IndoorMobilityRequest,
     MobilityResponse,
     MeasurementGeospatialAuditRequest,
     MeasurementMatchingAuditRequest,
@@ -128,7 +130,12 @@ from .models import (
     MeasurementRayTraceJobStatus,
     RadioMapGrid,
     RadioMapRequest,
+    IndoorRadioMapRequest,
     SceneExportRequest,
+    IndoorSceneActivationRequest,
+    IndoorSceneDeviceSyncRequest,
+    IndoorPathSolveRequest,
+    IndoorPathMatrixSolveRequest,
     SolveRequest,
     SolveResponse,
 )
@@ -151,6 +158,37 @@ from .experiment_store import (
     delete_experiment, create_preset, list_presets, delete_preset,
 )
 from .scene_export import scene_export_zip
+from .scene_coordinates import (
+    SceneCoordinatePreviewRequest,
+    SceneCoordinatePreviewResponse,
+    SceneCoordinateFrame,
+    preview_coordinate_transform,
+)
+from .scene_import import (
+    SceneImportError,
+    create_scene_import_preview,
+    get_scene_import_session,
+    get_scene_import_preview,
+    delete_scene_import_session,
+    list_scene_import_sessions,
+    select_scene_import_session,
+    clear_selected_scene_import_session,
+    get_selected_scene_import_session,
+)
+from .indoor_scene_runtime import (
+    IndoorSceneActivationError,
+    activate_indoor_scene,
+    deactivate_indoor_scene,
+    get_active_indoor_scene,
+    get_indoor_material_catalog,
+    get_indoor_scene_runtime_status,
+    sync_indoor_scene_devices,
+    solve_indoor_link,
+    solve_indoor_link_matrix,
+    solve_indoor_radiomap,
+    solve_indoor_radio_map_channel_analysis,
+    solve_indoor_mobility,
+)
 from .solver import (
     _notebook_tau_shape,
     solve_channel_grid,
@@ -163,6 +201,7 @@ from .solver import (
     get_radio_map_sector_analysis,
     get_radio_map_interference_matrix,
     get_radio_map_sample_cells,
+    is_indoor_radio_map,
 )
 
 app = FastAPI(title="SionnaRTStudio Backend", version="1.0.0")
@@ -174,7 +213,7 @@ async def radiomap_response_timing(request, call_next):
     """Log the serialized radio-map response stage as distinct from RT solve time."""
     started = time.perf_counter()
     response = await call_next(request)
-    if request.url.path == "/api/radiomap":
+    if request.url.path == "/api/radiomap" or request.url.path.endswith("/radiomap"):
         length = response.headers.get("content-length", "unknown")
         logger.debug(
             "Radio-map response ready: status=%s content_length=%s total_seconds=%.2f",
@@ -593,8 +632,10 @@ def api_radiomap_tx_export(map_id: str, tx_index: int):
     def rows():
         output = io.StringIO()
         writer = csv.writer(output)
+        indoor_coordinates = (data.get("sceneContext") or {}).get("sceneType") == "indoor"
         writer.writerow([
-            "x_enu_m", "y_enu_m", "z_enu_m", "path_gain_linear", "path_gain_db",
+            *( ["x_scene_local_m", "y_scene_local_m", "z_scene_local_m"] if indoor_coordinates else ["x_enu_m", "y_enu_m", "z_enu_m"] ),
+            "path_gain_linear", "path_gain_db",
             "rss_w", "rss_dbm", "sinr_linear", "sinr_db",
             "interference_power_dbm", "sir_db", "inr_db",
             "is_best_rss_server", "is_best_sinr_tx", "is_best_path_gain_tx",
@@ -723,10 +764,15 @@ def api_radiomap_sector_samples(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    # Resolve the coordinate frame before streaming begins. The cache may be
+    # evicted while the StreamingResponse generator is being consumed.
+    indoor_coordinates = is_indoor_radio_map(map_id)
+
     def rows():
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["cell_index", "x_enu_m", "y_enu_m", "z_enu_m", "rss_dbm", "sinr_db", "snr_db", "interference_dbm", "association_scope", "selection_mode"])
+        coordinate_headers = ["x_scene_local_m", "y_scene_local_m", "z_scene_local_m"] if indoor_coordinates else ["x_enu_m", "y_enu_m", "z_enu_m"]
+        writer.writerow(["cell_index", *coordinate_headers, "rss_dbm", "sinr_db", "snr_db", "interference_dbm", "association_scope", "selection_mode"])
         for item in rows_data:
             writer.writerow([
                 item["cellIndex"], item["x"], item["y"], item["z"],
@@ -749,6 +795,8 @@ def api_radiomap_channel_analysis(map_id: str, req: ChannelAnalysisRequest) -> d
     """Run a bounded, one-dispatch PathSolver analysis at selected map cells."""
     try:
         with _solve_lock:
+            if is_indoor_radio_map(map_id):
+                return solve_indoor_radio_map_channel_analysis(map_id, req)
             return solve_radio_map_channel_analysis(map_id, req)
     except Exception as exc:
         raise _solve_error(exc, "Radio-map channel analysis failed") from exc
@@ -1182,6 +1230,331 @@ def api_cir_bundle(req: CIRRequest) -> Response:
                 'attachment; filename="sionna_rt_studio_cir_all_pairs.zip"'
         },
     )
+
+
+@app.post("/api/scene/coordinates/preview", response_model=SceneCoordinatePreviewResponse)
+def api_scene_coordinate_preview(req: SceneCoordinatePreviewRequest) -> SceneCoordinatePreviewResponse:
+    """Preview how source-scene bounds map into canonical Sionna coordinates.
+
+    This endpoint is deliberately independent of Mitsuba/Sionna scene loading:
+    an importer can validate coordinate metadata and show the transformed
+    bounds before any geometry is registered in the RT runtime.
+    """
+    try:
+        return preview_coordinate_transform(req)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/scene/import/preview")
+async def api_scene_import_preview(
+    request: Request,
+    filename: str = Query(default="scene.zip", min_length=1, max_length=255),
+    up_axis: str = Query(...),
+    forward_axis: str = Query(...),
+    units: str = Query(...),
+    handedness: str = Query(...),
+    custom_scale_to_meters: float | None = Query(default=None, gt=0.0),
+    origin_x: float = Query(default=0.0),
+    origin_y: float = Query(default=0.0),
+    origin_z: float = Query(default=0.0),
+) -> dict:
+    """Stage a Mitsuba XML/ZIP scene and return a non-RT geometry preview.
+
+    The ZIP is sent as the raw request body to avoid python-multipart in Colab.
+    This endpoint never activates or mutates the current Sionna RT scene.
+    """
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > 250 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Scene archive exceeds the 250 MB upload limit")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header") from exc
+    try:
+        frame = SceneCoordinateFrame(
+            upAxis=up_axis,
+            forwardAxis=forward_axis,
+            units=units,
+            handedness=handedness,
+            customScaleToMeters=custom_scale_to_meters,
+            origin=(origin_x, origin_y, origin_z),
+        )
+        body = await request.body()
+        result = await run_in_threadpool(create_scene_import_preview, body, filename, frame)
+        return result
+    except SceneImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/scene/import/sessions")
+def api_list_scene_import_sessions() -> dict:
+    """List persisted staged indoor scenes and the currently selected session."""
+    return list_scene_import_sessions()
+
+
+@app.get("/api/scene/import/runtime/status")
+def api_indoor_scene_runtime_status() -> dict:
+    """Report the real in-process Sionna indoor scene activation state."""
+    return get_indoor_scene_runtime_status()
+
+
+@app.get("/api/scene/import/runtime/material-catalog")
+def api_indoor_scene_material_catalog() -> dict:
+    """Return the ITU material types and frequency ranges of this Sionna install."""
+    try:
+        return get_indoor_material_catalog()
+    except IndoorSceneActivationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/scene/import/{session_id}/select")
+def api_select_scene_import_session(session_id: str) -> dict:
+    """Select a staged scene; selecting another one unloads the previous indoor scene."""
+    with _solve_lock:
+        result = select_scene_import_session(session_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Unknown, expired or incomplete scene-import session")
+        active = get_active_indoor_scene()
+        if active is not None and active.session_id != session_id:
+            deactivate_indoor_scene(active.session_id)
+    return result
+
+
+@app.post("/api/scene/import/{session_id}/activate")
+def api_activate_indoor_scene(session_id: str, req: IndoorSceneActivationRequest) -> dict:
+    """Canonicalize and load a staged scene into the real Sionna RT runtime."""
+    try:
+        with _solve_lock:
+            session = get_scene_import_session(session_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="Unknown or expired scene-import session")
+            selected = get_selected_scene_import_session()
+            if selected is None or selected.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Select this scene in the Scene Manager before activating it in Sionna RT")
+            return activate_indoor_scene(
+                session,
+                req.materialMappings,
+                req.carrierFrequencyGhz,
+            )
+    except HTTPException:
+        raise
+    except IndoorSceneActivationError as exc:
+        message = str(exc)
+        status = 503 if "runtime is unavailable" in message.lower() else 422
+        raise HTTPException(status_code=status, detail=message) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected indoor scene activation failure for session %s", session_id)
+        raise HTTPException(status_code=500, detail=f"Unexpected Sionna scene activation error: {exc}") from exc
+
+
+@app.post("/api/scene/import/{session_id}/devices/sync")
+def api_sync_indoor_scene_devices(session_id: str, req: IndoorSceneDeviceSyncRequest) -> dict:
+    """Attach viewport-placed TX/RX devices and shared arrays to active Sionna RT."""
+    try:
+        with _solve_lock:
+            selected = get_selected_scene_import_session()
+            if selected is None or selected.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Select this indoor scene in the Scene Manager before synchronizing devices.")
+            active = get_active_indoor_scene()
+            if active is None or active.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Activate this indoor scene in Sionna RT before synchronizing TX/RX devices.")
+            return sync_indoor_scene_devices(
+                session_id=session_id,
+                txs=req.txs,
+                rxs=req.rxs,
+                carrier_frequency_ghz=req.carrierFrequencyGhz,
+                solver_options=req.options,
+            )
+    except HTTPException:
+        raise
+    except IndoorSceneActivationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected indoor TX/RX synchronization failure for session %s", session_id)
+        raise HTTPException(status_code=500, detail=f"Unexpected indoor device synchronization error: {exc}") from exc
+
+
+@app.post("/api/scene/import/{session_id}/mobility", response_model=MobilityResponse)
+def api_solve_indoor_mobility(session_id: str, req: IndoorMobilityRequest) -> MobilityResponse:
+    """Run the shared multi-TX mobility pipeline on the active indoor scene."""
+    try:
+        with _solve_lock:
+            selected = get_selected_scene_import_session()
+            if selected is None or selected.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Select this indoor scene in the Scene Manager before running mobility.")
+            active = get_active_indoor_scene()
+            if active is None or active.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Activate this indoor scene in Sionna RT before running mobility.")
+            started = time.perf_counter()
+            steps, execution, handover = solve_indoor_mobility(session_id, req)
+            execution["solveTimeMs"] = (time.perf_counter() - started) * 1000.0
+        return MobilityResponse(steps=steps, execution=execution, handover=handover)
+    except HTTPException:
+        raise
+    except IndoorSceneActivationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Indoor mobility solve failed for scene session %s", session_id)
+        raise _solve_error(exc, "Indoor mobility solve failed") from exc
+
+
+@app.post("/api/scene/import/{session_id}/path-solve")
+def api_solve_indoor_path(session_id: str, req: IndoorPathSolveRequest) -> dict:
+    """Run the real PathSolver against the active indoor scene.
+
+    This endpoint is deliberately separate from /api/solve: it never builds
+    outdoor OSM geometry. It applies the current viewport TX/RX snapshot to
+    the already-active scene and immediately dispatches PathSolver.
+    """
+    try:
+        with _solve_lock:
+            selected = get_selected_scene_import_session()
+            if selected is None or selected.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Select this indoor scene in the Scene Manager before running PathSolver.")
+            active = get_active_indoor_scene()
+            if active is None or active.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Activate this indoor scene in Sionna RT before running PathSolver.")
+            if any(device.sceneSessionId != session_id for device in [*req.txs, *req.rxs]):
+                raise HTTPException(status_code=422, detail="All submitted TX/RX devices must belong to the active indoor scene.")
+            # Bind the latest viewport/RF state directly before tracing. This
+            # replaces the old mandatory manual-sync + frontend-token workflow.
+            sync_indoor_scene_devices(
+                session_id=session_id,
+                txs=req.txs,
+                rxs=req.rxs,
+                carrier_frequency_ghz=req.carrierFrequencyGhz,
+                solver_options=req.options,
+            )
+            return solve_indoor_link(
+                session_id=session_id,
+                tx_id=req.txId,
+                rx_id=req.rxId,
+                max_depth=req.maxDepth,
+                solver_options=req.options,
+            )
+    except HTTPException:
+        raise
+    except IndoorSceneActivationError as exc:
+        message = str(exc)
+        status = 409 if ("synchron" in message.lower() or "active sionna" in message.lower()) else 422
+        raise HTTPException(status_code=status, detail=message) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected indoor PathSolver failure for session %s", session_id)
+        raise HTTPException(status_code=500, detail=f"Unexpected indoor PathSolver error: {exc}") from exc
+
+
+@app.post("/api/scene/import/{session_id}/path-solve-matrix")
+def api_solve_indoor_path_matrix(session_id: str, req: IndoorPathMatrixSolveRequest) -> dict:
+    """Run one native PathSolver dispatch and return every indoor TX×RX link."""
+    try:
+        with _solve_lock:
+            selected = get_selected_scene_import_session()
+            if selected is None or selected.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Select this indoor scene in the Scene Manager before running PathSolver.")
+            active = get_active_indoor_scene()
+            if active is None or active.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Activate this indoor scene in Sionna RT before running PathSolver.")
+            if any(device.sceneSessionId != session_id for device in [*req.txs, *req.rxs]):
+                raise HTTPException(status_code=422, detail="All submitted TX/RX devices must belong to the active indoor scene.")
+            # Bind the complete viewport snapshot once, then let Sionna's
+            # native receiver×transmitter tensors provide every pair result.
+            sync_indoor_scene_devices(
+                session_id=session_id,
+                txs=req.txs,
+                rxs=req.rxs,
+                carrier_frequency_ghz=req.carrierFrequencyGhz,
+                solver_options=req.options,
+            )
+            return solve_indoor_link_matrix(
+                session_id=session_id,
+                max_depth=req.maxDepth,
+                solver_options=req.options,
+            )
+    except HTTPException:
+        raise
+    except IndoorSceneActivationError as exc:
+        message = str(exc)
+        status = 409 if ("synchron" in message.lower() or "active sionna" in message.lower()) else 422
+        raise HTTPException(status_code=status, detail=message) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected indoor PathSolver matrix failure for session %s", session_id)
+        raise HTTPException(status_code=500, detail=f"Unexpected indoor PathSolver matrix error: {exc}") from exc
+
+
+@app.post("/api/scene/import/{session_id}/radiomap", response_model=RadioMapGrid)
+def api_indoor_radiomap(session_id: str, req: IndoorRadioMapRequest) -> RadioMapGrid:
+    """Run RadioMapSolver on the active imported indoor Sionna scene.
+
+    This route reuses the activated geometry/material registry and the shared
+    RadioMapSolver/analytics pipeline. It never rebuilds an outdoor OSM scene.
+    """
+    try:
+        with _solve_lock:
+            selected = get_selected_scene_import_session()
+            if selected is None or selected.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Select this indoor scene in the Scene Manager before computing a radio map.")
+            active = get_active_indoor_scene()
+            if active is None or active.session_id != session_id:
+                raise HTTPException(status_code=409, detail="Activate this indoor scene in Sionna RT before computing a radio map.")
+            return solve_indoor_radiomap(session_id, req)
+    except HTTPException:
+        raise
+    except IndoorSceneActivationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Indoor RadioMapSolver failed for scene session %s", session_id)
+        raise _solve_error(exc, "Indoor radio map failed") from exc
+
+
+
+@app.delete("/api/scene/import/selection")
+def api_clear_selected_scene_import_session() -> dict:
+    """Clear staged selection and unload it if that scene is the active indoor runtime."""
+    with _solve_lock:
+        selected = get_selected_scene_import_session()
+        cleared = clear_selected_scene_import_session()
+        if selected is not None:
+            deactivate_indoor_scene(selected.session_id)
+    return {"cleared": cleared}
+
+
+@app.get("/api/scene/import/{session_id}")
+def api_get_scene_import(session_id: str) -> dict:
+    session = get_scene_import_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired scene import session")
+    import copy
+    payload = copy.deepcopy(session.manifest)
+    active = get_active_indoor_scene()
+    if active is not None and active.session_id == session_id:
+        payload["activation"] = "active"
+        payload["activationDetails"] = dict(active.summary)
+    return payload
+
+
+@app.get("/api/scene/import/{session_id}/preview.glb")
+def api_get_scene_import_preview(session_id: str) -> Response:
+    content = get_scene_import_preview(session_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Geometry preview is unavailable for this scene")
+    return Response(
+        content=content,
+        media_type="model/gltf-binary",
+        headers={"Cache-Control": "no-store", "Content-Disposition": 'inline; filename="scene_preview.glb"'},
+    )
+
+
+@app.delete("/api/scene/import/{session_id}")
+def api_delete_scene_import(session_id: str) -> dict:
+    with _solve_lock:
+        deactivate_indoor_scene(session_id)
+        deleted = delete_scene_import_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Unknown or expired scene import session")
+    return {"deleted": True, "sessionId": session_id}
 
 
 @app.post("/api/scene-export")

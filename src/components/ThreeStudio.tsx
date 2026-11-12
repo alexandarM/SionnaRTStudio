@@ -10,7 +10,12 @@ import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { BuildingFootprint, GeoAnchor, Transmitter, Receiver, PropagationPath, ENUVector, MeasurementOverlayPoint } from '../types';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { BuildingFootprint, GeoAnchor, Transmitter, Receiver, PropagationPath, ENUVector, MeasurementOverlayPoint, SolverOptions, TrajectoryPoint } from '../types';
+import type { SceneImportPreview } from '../api';
+import { canonicalQuaternionToThree, classifyIndoorSurface, offsetCanonicalPosition, surfaceNormalToCanonicalQuaternion, threeDirectionToCanonical, threeQuaternionToCanonical, threeToCanonicalPosition, canonicalToThreePosition, type SceneVector3 } from '../utils/indoorDevicePlacement';
+import { buildPlanarArrayPreview, canonicalArrayOffsetToThree, canonicalDirectionToThree, getArrayElementVisualDimensions, localSteeringDirectionCanonical } from '../utils/antennaArrayPreview';
 import { cn } from '../lib/utils';
 import { enuToLatLon, getSectorHue, isPointInPolygon, latLonToENU } from '../utils';
 import { RadioMapGrid } from '../types';
@@ -239,6 +244,9 @@ function makeStreetLabelMesh(
 interface ThreeStudioProps {
   buildings: BuildingFootprint[];
   anchor: GeoAnchor;
+  indoorScene?: SceneImportPreview | null;
+  freqGhz: number;
+  solverOptions: SolverOptions;
   tx: Transmitter;
   rx: Receiver;
   txs?: Transmitter[];
@@ -256,14 +264,17 @@ interface ThreeStudioProps {
   rmVmax: number;
   onTxUpdate: (tx: Transmitter) => void;
   onRxUpdate: (rx: Receiver) => void;
+  onSelectTx: (id: string) => void;
+  onSelectRx: (id: string) => void;
   activeMode: 'link' | 'heatmap' | 'playback';
   placementMode: 'none' | 'tx' | 'rx';
   setPlacementMode: (mode: 'none' | 'tx' | 'rx') => void;
   showOutlines: boolean;
   setShowOutlines: (val: boolean) => void;
   mobilityRxPosition: ENUVector | null;
-  trajectoryPoints: { lat: number; lon: number; enu: { x: number; y: number; z: number } }[];
-  setTrajectoryPoints: (pts: { lat: number; lon: number; enu: { x: number; y: number; z: number } }[]) => void;
+  indoorMobilityReceiverHeight: number;
+  trajectoryPoints: TrajectoryPoint[];
+  setTrajectoryPoints: (pts: TrajectoryPoint[]) => void;
   measurementOverlayPoints: MeasurementOverlayPoint[];
   measurementOverlayLabel: string;
   measurementOverlayVisible: boolean;
@@ -281,6 +292,9 @@ function enuToThree(v: ENUVector): THREE.Vector3 {
 export function ThreeStudio({
   buildings,
   anchor,
+  indoorScene = null,
+  freqGhz,
+  solverOptions,
   tx,
   rx,
   txs,
@@ -298,12 +312,15 @@ export function ThreeStudio({
   rmVmax,
   onTxUpdate,
   onRxUpdate,
+  onSelectTx,
+  onSelectRx,
   activeMode,
   placementMode,
   setPlacementMode,
   showOutlines,
   setShowOutlines,
   mobilityRxPosition,
+  indoorMobilityReceiverHeight,
   trajectoryPoints,
   setTrajectoryPoints,
   measurementOverlayPoints,
@@ -316,6 +333,10 @@ export function ThreeStudio({
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const captureScreenshotRef = useRef<(() => void) | null>(null);
   const focusMeasurementOverlayRef = useRef<(() => void) | null>(null);
+  const transformControlsRef = useRef<TransformControls | null>(null);
+  const selectedIndoorDeviceRef = useRef<{ kind: 'tx' | 'rx'; id: string } | null>(null);
+  const lastActiveDeviceIdsRef = useRef({ tx: activeTxId, rx: activeRxId });
+  const transformModeRef = useRef<'translate' | 'rotate'>('translate');
 
   const [renderStats, setRenderStats] = useState({
     fps: 0,
@@ -336,6 +357,7 @@ export function ThreeStudio({
   const [cameraMode, setCameraMode] = useState<'orbit' | 'lockTx'>('orbit');
   const [pathDrawingMode, setPathDrawingMode] = useState(false);
   const [radioMapDisplayMode, setRadioMapDisplayMode] = useState<'metric' | 'rss_association' | 'sinr_association' | 'path_gain_association' | 'top_interferer'>('metric');
+  const [deviceTransformMode, setDeviceTransformMode] = useState<'translate' | 'rotate'>('translate');
 
   const [hoveredCoordinate, setHoveredCoordinate] = useState<ENUVector | null>(null);
   const [hoveredMeasurementPoints, setHoveredMeasurementPoints] = useState<MeasurementOverlayPoint[]>([]);
@@ -347,6 +369,9 @@ export function ThreeStudio({
   const stateRef = useRef({
     buildings,
     anchor,
+    indoorScene,
+    freqGhz,
+    solverOptions,
     tx,
     rx,
     txs,
@@ -369,6 +394,7 @@ export function ThreeStudio({
     showOutlines,
     pathDrawingMode,
     mobilityRxPosition,
+    indoorMobilityReceiverHeight,
     trajectoryPoints,
     setTrajectoryPoints,
     measurementOverlayPoints,
@@ -376,13 +402,24 @@ export function ThreeStudio({
     measurementOverlayVisible,
     onTxUpdate,
     onRxUpdate,
+    onSelectTx,
+    onSelectRx,
     setPlacementMode
   });
 
   useEffect(() => {
+    if (activeTxId && activeTxId !== lastActiveDeviceIdsRef.current.tx) {
+      selectedIndoorDeviceRef.current = { kind: 'tx', id: activeTxId };
+    } else if (activeRxId && activeRxId !== lastActiveDeviceIdsRef.current.rx) {
+      selectedIndoorDeviceRef.current = { kind: 'rx', id: activeRxId };
+    }
+    lastActiveDeviceIdsRef.current = { tx: activeTxId, rx: activeRxId };
     stateRef.current = {
       buildings,
       anchor,
+      indoorScene,
+      freqGhz,
+      solverOptions,
       tx,
       rx,
       txs,
@@ -405,6 +442,7 @@ export function ThreeStudio({
       showOutlines,
       pathDrawingMode,
       mobilityRxPosition,
+      indoorMobilityReceiverHeight,
       trajectoryPoints,
       setTrajectoryPoints,
       measurementOverlayPoints,
@@ -412,9 +450,11 @@ export function ThreeStudio({
       measurementOverlayVisible,
       onTxUpdate,
       onRxUpdate,
+      onSelectTx,
+      onSelectRx,
       setPlacementMode
     };
-  }, [buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, focusedRadioMapCellIndex, radioMapDisplayMode, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, pathDrawingMode, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, measurementOverlayPoints, measurementOverlayLabel, measurementOverlayVisible, onTxUpdate, onRxUpdate, setPlacementMode]);
+  }, [buildings, anchor, indoorScene, freqGhz, solverOptions, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, focusedRadioMapCellIndex, radioMapDisplayMode, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, pathDrawingMode, mobilityRxPosition, indoorMobilityReceiverHeight, trajectoryPoints, setTrajectoryPoints, measurementOverlayPoints, measurementOverlayLabel, measurementOverlayVisible, onTxUpdate, onRxUpdate, onSelectTx, onSelectRx, setPlacementMode]);
 
   useEffect(() => {
     if (!containerRef.current || !canvasRef.current) return;
@@ -424,25 +464,36 @@ export function ThreeStudio({
 
     // 1. Initial Scene Setup
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xf8fafc); // Bright elegant light mode background
+    scene.background = new THREE.Color(indoorScene ? 0x111820 : 0xf8fafc); // Neutral studio background for indoor previews
     // No distance fog — it washed the whole scene hazy when zoomed out.
 
     // 2. Camera Setup. Near plane at 1 (not 0.1) so the depth buffer keeps
     // precision across the large city extent → no z-fighting flicker far out.
-    const previewExtent = buildings.reduce((extent, feature) => {
-      feature.enuPoints.forEach((point) => {
-        extent = Math.max(extent, Math.abs(point.x), Math.abs(point.y));
-      });
-      return extent;
-    }, 0);
-    const previewGroundSize = Math.max(2_000, Math.ceil((previewExtent + 500) * 2));
-    const camera = new THREE.PerspectiveCamera(45, width / height, 1, Math.max(6_000, previewGroundSize * 1.8));
-    const initialDistance = previewExtent > 600 ? previewExtent * 2.6 : 240;
-    camera.position.set(
-      0,
-      previewExtent > 600 ? initialDistance * 0.55 : 180,
-      previewExtent > 600 ? initialDistance * 0.83 : 240,
-    );
+    const indoorBounds = indoorScene?.canonicalBounds ?? null;
+    const indoorCenterCanonical: SceneVector3 = indoorBounds
+      ? [0, 1, 2].map((axis) => (indoorBounds.minimum[axis] + indoorBounds.maximum[axis]) / 2) as SceneVector3
+      : [0, 0, 0];
+    const indoorSize = indoorBounds
+      ? [0, 1, 2].map((axis) => indoorBounds.maximum[axis] - indoorBounds.minimum[axis])
+      : [0, 0, 0];
+    const previewExtent = indoorBounds
+      ? Math.max(...indoorSize, 1) / 2
+      : buildings.reduce((extent, feature) => {
+          feature.enuPoints.forEach((point) => { extent = Math.max(extent, Math.abs(point.x), Math.abs(point.y)); });
+          return extent;
+        }, 0);
+    const previewGroundSize = indoorBounds
+      ? Math.max(12, Math.ceil((previewExtent + 4) * 2))
+      : Math.max(2_000, Math.ceil((previewExtent + 500) * 2));
+    const camera = new THREE.PerspectiveCamera(45, width / height, indoorBounds ? 0.01 : 1, Math.max(indoorBounds ? 100 : 6_000, previewGroundSize * 1.8));
+    const initialDistance = indoorBounds ? Math.max(...indoorSize, 1) * 2.2 : (previewExtent > 600 ? previewExtent * 2.6 : 240);
+    if (indoorBounds) {
+      const center = new THREE.Vector3(indoorCenterCanonical[0], indoorCenterCanonical[2], -indoorCenterCanonical[1]);
+      camera.position.copy(center).add(new THREE.Vector3(initialDistance * 1.1, initialDistance * 0.85, initialDistance * 1.25));
+      camera.lookAt(center);
+    } else {
+      camera.position.set(0, previewExtent > 600 ? initialDistance * 0.55 : 180, previewExtent > 600 ? initialDistance * 0.83 : 240);
+    }
 
     // 3. WebGL Renderer. logarithmicDepthBuffer eliminates the flicker between
     // the many coplanar flat layers (ground, grid, roads, parks, water).
@@ -469,7 +520,7 @@ export function ThreeStudio({
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
-    controls.maxPolarAngle = Math.PI / 2 - 0.02; // restrict to ground-level rotations
+    controls.maxPolarAngle = indoorScene ? Math.PI - 0.02 : Math.PI / 2 - 0.02; // full indoor orbit; outdoor remains ground-level
     controls.screenSpacePanning = true;
 
     // 5. Lights — soft, even, Sionna-preview style (mostly ambient + sky/ground fill).
@@ -498,7 +549,8 @@ export function ThreeStudio({
     // Grid Floor matching Light Minimal GIS setup
     const gridDivisions = Math.min(240, Math.max(40, Math.ceil(previewGroundSize / 100)));
     const gridHelper = new THREE.GridHelper(previewGroundSize, gridDivisions, 0x94a3b8, 0xcbd5e1);
-    gridHelper.position.y = -0.1;
+    gridHelper.position.y = indoorBounds ? indoorBounds.minimum[2] - 0.015 : -0.1;
+    gridHelper.visible = Boolean(indoorScene);
     scene.add(gridHelper);
 
     // Ground slab
@@ -511,6 +563,7 @@ export function ThreeStudio({
     const ground = new THREE.Mesh(groundGeom, groundMat);
     ground.rotation.x = -Math.PI / 2;
     ground.position.y = -0.2;
+    ground.visible = !indoorScene;
     ground.receiveShadow = true;
     scene.add(ground);
 
@@ -524,6 +577,13 @@ export function ThreeStudio({
     const trajectoryGroup = new THREE.Group();
     const measurementGroup = new THREE.Group();
     const interactionGroup = new THREE.Group();
+    const indoorStaticGroup = new THREE.Group();
+    indoorStaticGroup.name = 'indoor-static-geometry';
+    // Imported GLB is canonical Z-up; adapt once to this viewport's Y-up world.
+    indoorStaticGroup.rotation.x = -Math.PI / 2;
+    const indoorDevicePickables: THREE.Object3D[] = [];
+    const indoorDeviceRoots = new Map<string, THREE.Group>();
+    const indoorPickMeshes: THREE.Mesh[] = [];
     let measurementPointsCloud: THREE.Points | null = null;
     let measurementPointsCloudPoints: MeasurementOverlayPoint[] = [];
 
@@ -551,6 +611,36 @@ export function ThreeStudio({
     scene.add(trajectoryGroup);
     scene.add(measurementGroup);
     scene.add(interactionGroup);
+    scene.add(indoorStaticGroup);
+
+    const deviceTransformControls = new TransformControls(camera, renderer.domElement);
+    deviceTransformControls.setMode(transformModeRef.current);
+    deviceTransformControls.setSpace('world');
+    deviceTransformControls.size = 0.85;
+    const transformHelper = deviceTransformControls.getHelper();
+    transformHelper.visible = false;
+    scene.add(transformHelper);
+    transformControlsRef.current = deviceTransformControls;
+    deviceTransformControls.addEventListener('dragging-changed', (event: any) => {
+      controls.enabled = !Boolean(event.value);
+    });
+    deviceTransformControls.addEventListener('mouseUp', () => {
+      const object = deviceTransformControls.object as THREE.Group | undefined;
+      if (!object || !object.userData.deviceId || !object.userData.deviceKind) return;
+      const id = String(object.userData.deviceId);
+      const kind = object.userData.deviceKind as 'tx' | 'rx';
+      const scenePosition = threeToCanonicalPosition(object.position);
+      const sceneOrientation = threeQuaternionToCanonical(object.quaternion);
+      const sceneNormal = threeDirectionToCanonical(new THREE.Vector3(0, 1, 0).applyQuaternion(object.quaternion));
+      const current = stateRef.current;
+      if (kind === 'tx') {
+        const item = (current.txs ?? [current.tx]).find((entry) => entry.id === id);
+        if (item) current.onTxUpdate({ ...item, scenePosition, sceneNormal, sceneOrientation, sceneSessionId: current.indoorScene?.sessionId });
+      } else {
+        const item = (current.rxs ?? [current.rx]).find((entry) => entry.id === id);
+        if (item) current.onRxUpdate({ ...item, scenePosition, sceneNormal, sceneOrientation, sceneSessionId: current.indoorScene?.sessionId });
+      }
+    });
 
     // Build one disposable Three.js LOD representation. `toleranceMeters`
     // affects only preview geometry; source BuildingFootprint objects are read-only.
@@ -1189,6 +1279,12 @@ export function ThreeStudio({
       loadedPreviewChunkCount = 0;
 
       const current = stateRef.current;
+      if (current.indoorScene) {
+        // Imported GLB is the authoritative static geometry in indoor mode.
+        buildingPickMeshes.length = 0;
+        setPreviewProgress({ loaded: 1, total: 1, refined: 0, streaming: false });
+        return;
+      }
       const groupedFeatures = new Map<string, BuildingFootprint[]>();
       const chunkSize = PREVIEW_CHUNK_METERS;
 
@@ -1544,10 +1640,193 @@ export function ThreeStudio({
 
     // 7. NODE RENDERING (Tx and Rx panel tower model representations)
     function drawNodes3D() {
+      const current = stateRef.current;
+
+      if (current.indoorScene) {
+        // Detach before disposing old marker roots: TransformControls keeps a
+        // reference to its attached Object3D until detach() is called.
+        deviceTransformControls.detach();
+        transformHelper.visible = false;
+        clearGroup(transmitterGroup);
+        clearGroup(receiverGroup);
+        indoorDeviceRoots.clear();
+        indoorDevicePickables.length = 0;
+
+        const makeIndoorDevice = (kind: 'tx' | 'rx', item: Transmitter | Receiver, color: number, labelColor: string) => {
+          if (!item.scenePosition || item.sceneSessionId !== current.indoorScene?.sessionId) return;
+          const root = new THREE.Group();
+          root.name = `indoor-${kind}-${item.id}`;
+          root.userData.deviceId = item.id;
+          root.userData.deviceKind = kind;
+          root.position.set(item.scenePosition[0], item.scenePosition[2], -item.scenePosition[1]);
+          root.quaternion.copy(item.sceneOrientation ? canonicalQuaternionToThree(item.sceneOrientation) : new THREE.Quaternion());
+
+          const isActive = kind === 'tx'
+            ? item.id === (current.activeTxId ?? current.tx.id)
+            : item.id === (current.activeRxId ?? current.rx.id);
+          const polarization = kind === 'tx' ? current.solverOptions.txPolarization : current.solverOptions.rxPolarization;
+          const pattern = kind === 'tx' ? current.solverOptions.txPattern : current.solverOptions.rxPattern;
+          let arrayPreview;
+          try {
+            arrayPreview = buildPlanarArrayPreview(item.antennaArraySize, current.freqGhz, polarization, 0.5);
+          } catch (error) {
+            console.warn(`Invalid ${kind.toUpperCase()} array preview configuration`, error);
+            arrayPreview = buildPlanarArrayPreview([1, 1], current.freqGhz, polarization, 0.5);
+          }
+
+          // Compact mount and pickable device core. The root's local +Y is the
+          // mounted boresight in ThreeStudio's Y-up viewport; canonical +Z maps to it.
+          const halo = new THREE.Mesh(
+            new THREE.TorusGeometry(kind === 'tx' ? 0.19 : 0.16, 0.012, 8, 28),
+            new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.92, depthTest: true }),
+          );
+          halo.rotation.x = -Math.PI / 2;
+          halo.position.y = 0.015;
+          root.add(halo);
+
+          const core = new THREE.Mesh(
+            new THREE.SphereGeometry(kind === 'tx' ? 0.075 : 0.065, 14, 10),
+            new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: isActive ? 0.28 : 0.12, roughness: 0.38, metalness: 0.12 }),
+          );
+          core.position.y = 0.10;
+          core.userData.deviceId = item.id;
+          core.userData.deviceKind = kind;
+          root.add(core);
+          indoorDevicePickables.push(core);
+
+          const arrayGroup = new THREE.Group();
+          arrayGroup.name = `antenna-array-${kind}-${item.id}`;
+          arrayGroup.position.y = kind === 'tx' ? 0.19 : 0.14;
+          root.add(arrayGroup);
+
+          const width = Math.max(arrayPreview.horizontalApertureMeters + arrayPreview.spacingMeters * 0.7, 0.055);
+          const height = Math.max(arrayPreview.verticalApertureMeters + arrayPreview.spacingMeters * 0.7, 0.055);
+          if (isActive) {
+            const plate = new THREE.Mesh(
+              new THREE.BoxGeometry(width, Math.max(0.008, Math.min(0.02, arrayPreview.spacingMeters * 0.12)), height),
+              new THREE.MeshStandardMaterial({ color: kind === 'tx' ? 0x293746 : 0x294650, metalness: 0.48, roughness: 0.4 }),
+            );
+            arrayGroup.add(plate);
+
+            // Draw the active planar element grid with one InstancedMesh. The
+            // normalized 0.5λ pitch matches the backend PlanarArray defaults.
+            const elementVisual = getArrayElementVisualDimensions(arrayPreview.spacingMeters);
+            const elementGeometry = new THREE.CylinderGeometry(
+              elementVisual.radiusMeters,
+              elementVisual.radiusMeters,
+              elementVisual.thicknessMeters,
+              10,
+            );
+            const elementMaterial = new THREE.MeshStandardMaterial({
+              color: kind === 'tx' ? 0xf0a46e : 0x77c5d8,
+              emissive: kind === 'tx' ? 0x4a2412 : 0x123b4b,
+              emissiveIntensity: 0.32,
+              metalness: 0.52,
+              roughness: 0.3,
+            });
+            const elements = new THREE.InstancedMesh(elementGeometry, elementMaterial, arrayPreview.elementCount);
+            elements.name = `antenna-elements-${arrayPreview.columns}x${arrayPreview.rows}`;
+            const dummy = new THREE.Object3D();
+            arrayPreview.elementOffsetsCanonical.forEach((offset, index) => {
+              const local = canonicalArrayOffsetToThree(offset);
+              dummy.position.set(local.x, 0.014, local.z);
+              dummy.rotation.set(0, 0, 0);
+              dummy.updateMatrix();
+              elements.setMatrixAt(index, dummy.matrix);
+            });
+            elements.instanceMatrix.needsUpdate = true;
+            elements.frustumCulled = false;
+            arrayGroup.add(elements);
+          } else {
+            // Non-active devices keep a lightweight panel marker; only the
+            // selected device expands into a full element grid.
+            const compact = new THREE.Mesh(
+              new THREE.BoxGeometry(0.075, 0.018, 0.075),
+              new THREE.MeshStandardMaterial({ color: kind === 'tx' ? 0x586a78 : 0x4d7780, metalness: 0.35, roughness: 0.5 }),
+            );
+            arrayGroup.add(compact);
+          }
+
+          if (kind === 'tx' && isActive) {
+            // Beam arrow is a direction indicator only, not an antenna gain
+            // pattern. Indoor steering angles are relative to device-local +Z.
+            const transmitter = item as Transmitter;
+            const localDirection = canonicalDirectionToThree(
+              localSteeringDirectionCanonical(transmitter.indoorBeamSteering?.azimuthDeg ?? 0, transmitter.indoorBeamSteering?.elevationDeg ?? 0),
+            );
+            const beamLength = Math.max(0.65, Math.hypot(width, height) * 1.35);
+            const beamArrow = new THREE.ArrowHelper(
+              localDirection,
+              new THREE.Vector3(0, 0.035, 0),
+              beamLength,
+              0xffb15e,
+              Math.min(0.18, beamLength * 0.22),
+              Math.min(0.10, beamLength * 0.12),
+            );
+            beamArrow.name = 'indoor-local-beam-direction';
+            arrayGroup.add(beamArrow);
+          }
+
+          if (kind === 'tx') {
+            const mast = new THREE.Mesh(
+              new THREE.CylinderGeometry(0.018, 0.025, 0.11, 10),
+              new THREE.MeshStandardMaterial({ color: 0xe8edf2, metalness: 0.35, roughness: 0.45 }),
+            );
+            mast.position.y = 0.055;
+            root.add(mast);
+          }
+
+          const label = makeLabelSprite(item.name, labelColor);
+          label.scale.multiplyScalar(0.048);
+          label.position.set(0, 0.32 + height * 0.55, 0);
+          root.add(label);
+
+          root.userData.antenna = {
+            columns: arrayPreview.columns,
+            rows: arrayPreview.rows,
+            elementCount: arrayPreview.elementCount,
+            polarizationPorts: arrayPreview.polarizationPorts,
+            pattern,
+            polarization,
+            wavelengthMeters: arrayPreview.wavelengthMeters,
+            spacingMeters: arrayPreview.spacingMeters,
+            horizontalApertureMeters: arrayPreview.horizontalApertureMeters,
+            verticalApertureMeters: arrayPreview.verticalApertureMeters,
+            beamSteeringFrame: kind === 'tx' ? 'device_local' : 'device_orientation',
+            indoorBeamSteering: kind === 'tx' ? (item as Transmitter).indoorBeamSteering ?? { azimuthDeg: 0, elevationDeg: 0 } : undefined,
+          };
+          (kind === 'tx' ? transmitterGroup : receiverGroup).add(root);
+          indoorDeviceRoots.set(`${kind}:${item.id}`, root);
+        };
+
+        const allTxs = current.txs?.length ? current.txs : [current.tx];
+        const allRxs = current.rxs?.length ? current.rxs : [current.rx];
+        allTxs.forEach((item) => makeIndoorDevice('tx', item, item.id === current.activeTxId ? 0xf07855 : 0xc56d50, '#e7b6a2'));
+        allRxs.forEach((item) => makeIndoorDevice('rx', item, item.id === current.activeRxId ? 0x55a9c3 : 0x4f8797, '#b6dbe4'));
+
+        let selected = selectedIndoorDeviceRef.current;
+        if (!selected || !indoorDeviceRoots.has(`${selected.kind}:${selected.id}`)) {
+          const activeTxIdNow = current.activeTxId ?? current.tx.id;
+          const activeRxIdNow = current.activeRxId ?? current.rx.id;
+          selected = indoorDeviceRoots.has(`tx:${activeTxIdNow}`)
+            ? { kind: 'tx', id: activeTxIdNow }
+            : indoorDeviceRoots.has(`rx:${activeRxIdNow}`)
+              ? { kind: 'rx', id: activeRxIdNow }
+              : null;
+          selectedIndoorDeviceRef.current = selected;
+        }
+        const selectedRoot = selected ? indoorDeviceRoots.get(`${selected.kind}:${selected.id}`) : undefined;
+        if (selectedRoot) {
+          deviceTransformControls.setMode(transformModeRef.current);
+          deviceTransformControls.attach(selectedRoot);
+          transformHelper.visible = true;
+        }
+        return;
+      }
+
+      // Outdoor device previews retain the original rendering path.
       clearGroup(transmitterGroup);
       clearGroup(receiverGroup);
-
-      const current = stateRef.current;
 
       // Exact original OSM footprint lookup; preview LOD does not affect roof height.
       const rooftopZ = rooftopHeightAt;
@@ -1728,8 +2007,17 @@ export function ThreeStudio({
           const b = points[index + 1];
           positions.push(a.x, a.y, a.z, b.x, b.y, b.z);
           colors.push(color.r, color.g, color.b, color.r, color.g, color.b);
-          markerPositions.push(a);
-          markerColors.push(color);
+        }
+
+        // Indoor Sionna-style ray visualization is line-only: the points
+        // already encode TX -> interactions -> RX, so extra octahedra obscure
+        // the actual paths in a room-sized scene. Preserve the legacy marker
+        // layer exclusively for outdoor mode.
+        if (!indoorBounds) {
+          for (let index = 0; index < points.length - 1; index++) {
+            markerPositions.push(points[index]);
+            markerColors.push(color);
+          }
         }
       });
 
@@ -1749,8 +2037,8 @@ export function ThreeStudio({
         pathsGroup.add(segments);
       }
 
-      // The small reflection/interaction markers use instancing: all markers
-      // share one low-poly octahedron geometry and one material/draw call.
+      // Outdoor keeps its established interaction marker layer. Indoor is
+      // deliberately line-only, matching the native Sionna ray-path view.
       if (markerPositions.length > 0) {
         const markerGeometry = new THREE.OctahedronGeometry(0.7, 1);
         const markerMaterial = new THREE.MeshBasicMaterial({ wireframe: true });
@@ -1819,7 +2107,7 @@ export function ThreeStudio({
 
       // Association modes use categorical sector indices, not a continuous
       // colormap. They are pure visualization over the same physical radio map.
-      type ValPt = { x: number; y: number; value: number; txIndex: number };
+      type ValPt = { x: number; y: number; z: number; value: number; txIndex: number };
       const valid: ValPt[] = rm.cells
         .map((c) => {
           const association = displayMode === 'rss_association' ? c.servingTx
@@ -1831,7 +2119,7 @@ export function ThreeStudio({
             : metric === 'power' ? c.powerDbm
               : metric === 'sinr' ? (c.sinr ?? NaN)
                 : (c.metricValue ?? NaN);
-          return { x: c.x, y: c.y, value, txIndex: association == null ? -1 : association };
+          return { x: c.x, y: c.y, z: c.z, value, txIndex: association == null ? -1 : association };
         })
         .filter((p) => associationMode || Number.isFinite(p.value));
       if (valid.length === 0) {
@@ -1875,8 +2163,9 @@ export function ThreeStudio({
       );
 
       valid.forEach((cell, idx) => {
-        // Sit just above the ground plane so the field reads as painted on it.
-        const threePos = enuToThree({ x: cell.x, y: cell.y, z: 0.2 });
+        // Outdoor coverage is painted just above the ground. Indoor coverage
+        // is a horizontal sampling plane at each Sionna cell's canonical Z.
+        const threePos = enuToThree({ x: cell.x, y: cell.y, z: current.indoorScene ? cell.z : 0.2 });
         dummy.position.copy(threePos);
         dummy.updateMatrix();
         instMesh.setMatrixAt(idx, dummy.matrix);
@@ -1919,13 +2208,18 @@ export function ThreeStudio({
       const focusedIndex = current.focusedRadioMapCellIndex;
       const focusedCell = focusedIndex == null ? null : rm.cells[focusedIndex];
       if (focusedCell) {
+        const indoorMap = Boolean(current.indoorScene);
         const pinX = focusedCell.x;
         const pinZ = -focusedCell.y;
-        const baseY = 0.72;
+        const baseY = indoorMap ? focusedCell.z + 0.025 : 0.72;
         const marker = new THREE.Group();
         marker.name = `focused-radio-map-cell-${focusedIndex}`;
+        const ringInner = indoorMap ? Math.max(0.025, size * 0.18) : Math.max(1.2, size * 0.42);
+        const ringOuter = indoorMap ? Math.max(0.05, size * 0.28) : Math.max(2.0, size * 0.62);
+        const pinStemHeight = indoorMap ? Math.max(0.12, Math.min(0.45, size * 0.5)) : 7;
+        const pinRadius = indoorMap ? Math.max(0.025, Math.min(0.07, size * 0.08)) : 1.5;
 
-        const ringGeometry = new THREE.RingGeometry(Math.max(1.2, size * 0.42), Math.max(2.0, size * 0.62), 40);
+        const ringGeometry = new THREE.RingGeometry(ringInner, ringOuter, 40);
         ringGeometry.rotateX(-Math.PI / 2);
         const ringMaterial = new THREE.MeshBasicMaterial({
           color: 0xf59e0b, side: THREE.DoubleSide, transparent: true, opacity: 0.98,
@@ -1938,17 +2232,17 @@ export function ThreeStudio({
 
         const stemGeometry = new THREE.BufferGeometry().setFromPoints([
           new THREE.Vector3(pinX, baseY, pinZ),
-          new THREE.Vector3(pinX, baseY + 7, pinZ),
+          new THREE.Vector3(pinX, baseY + pinStemHeight, pinZ),
         ]);
         const stemMaterial = new THREE.LineBasicMaterial({ color: 0xb45309, depthTest: false, depthWrite: false, toneMapped: false });
         const stem = new THREE.Line(stemGeometry, stemMaterial);
         stem.renderOrder = 101;
         marker.add(stem);
 
-        const pinGeometry = new THREE.SphereGeometry(1.5, 16, 12);
+        const pinGeometry = new THREE.SphereGeometry(pinRadius, 16, 12);
         const pinMaterial = new THREE.MeshBasicMaterial({ color: 0xfbbf24, depthTest: false, depthWrite: false, toneMapped: false });
         const pin = new THREE.Mesh(pinGeometry, pinMaterial);
-        pin.position.set(pinX, baseY + 7, pinZ);
+        pin.position.set(pinX, baseY + pinStemHeight, pinZ);
         pin.renderOrder = 102;
         marker.add(pin);
         heatmapGroup.add(marker);
@@ -1962,16 +2256,26 @@ export function ThreeStudio({
       clearGroup(trajectoryGroup);
 
       const current = stateRef.current;
-      if (current.trajectoryPoints.length === 0) return;
+      const indoor = Boolean(current.indoorScene);
+      const visiblePoints = current.trajectoryPoints.filter((point) => indoor
+        ? point.coordinateFrame === 'indoor_scene_local'
+        : point.coordinateFrame !== 'indoor_scene_local');
+      if (visiblePoints.length === 0) return;
 
-      const pts = current.trajectoryPoints.map((p) => enuToThree({ ...p.enu, z: 0.35 }));
+      const pts = visiblePoints.map((point) => indoor
+        ? canonicalToThreePosition([point.enu.x, point.enu.y, point.enu.z])
+        : enuToThree({ ...point.enu, z: 0.35 }));
       if (pts.length >= 2) {
         const geom = new THREE.BufferGeometry().setFromPoints(pts);
         const mat = new THREE.LineBasicMaterial({ color: 0x10b981, transparent: true, opacity: 0.95 });
-        const line = new THREE.Line(geom, mat);
-        trajectoryGroup.add(line);
+        trajectoryGroup.add(new THREE.Line(geom, mat));
       }
 
+      const bounds = current.indoorScene?.canonicalBounds;
+      const span = bounds
+        ? Math.min(Number(bounds.maximum[0]) - Number(bounds.minimum[0]), Number(bounds.maximum[1]) - Number(bounds.minimum[1]))
+        : 0;
+      const markerScale = indoor ? Math.max(0.035, Math.min(0.10, span * 0.012)) : 1;
       const markerGeometry = new THREE.SphereGeometry(1, 12, 12);
       const markerMaterial = new THREE.MeshBasicMaterial();
       const markers = new THREE.InstancedMesh(markerGeometry, markerMaterial, pts.length);
@@ -1979,7 +2283,7 @@ export function ThreeStudio({
       pts.forEach((pt, idx) => {
         const isEndpoint = idx === 0 || idx === pts.length - 1;
         const color = new THREE.Color(idx === 0 ? 0x10b981 : idx === pts.length - 1 ? 0xf27d26 : 0xe2e8f0);
-        const radius = isEndpoint ? 1.1 : 0.75;
+        const radius = markerScale * (isEndpoint ? 1.25 : 0.82);
         dummy.position.copy(pt);
         dummy.scale.setScalar(radius);
         dummy.updateMatrix();
@@ -1990,6 +2294,22 @@ export function ThreeStudio({
       if (markers.instanceColor) markers.instanceColor.needsUpdate = true;
       markers.computeBoundingSphere();
       trajectoryGroup.add(markers);
+
+      // Playback marker is separate from the editable/static RX device. That
+      // keeps the selected viewport device and its antenna orientation intact.
+      if (indoor && current.activeMode === 'playback' && current.mobilityRxPosition) {
+        const moving = new THREE.Mesh(
+          new THREE.SphereGeometry(markerScale * 1.7, 16, 12),
+          new THREE.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.96 }),
+        );
+        moving.position.copy(canonicalToThreePosition([
+          current.mobilityRxPosition.x,
+          current.mobilityRxPosition.y,
+          current.mobilityRxPosition.z,
+        ]));
+        moving.name = 'indoor-mobility-rx-playback-marker';
+        trajectoryGroup.add(moving);
+      }
     }
 
     // Field-measurement overlay: one point per unique GPS location. The point
@@ -1998,6 +2318,7 @@ export function ThreeStudio({
     function drawMeasurementOverlay3D() {
       clearGroup(measurementGroup);
       measurementPointsCloud = null;
+      if (stateRef.current.indoorScene) return;
       measurementPointsCloudPoints = [];
       const current = stateRef.current;
       measurementGroup.visible = current.measurementOverlayVisible;
@@ -2080,13 +2401,55 @@ export function ThreeStudio({
     // the first animation frame via the change watcher below.
     void rebuildBuildings3D();
 
-    // 10. ANCHORED RAYCAST EVENT LISTENER (Snaps Tx / Rx precisely onto ground/roof points)
+    let indoorLoadCancelled = false;
+    if (indoorScene?.previewUrl) {
+      const loader = new GLTFLoader();
+      loader.load(
+        indoorScene.previewUrl,
+        (gltf) => {
+          if (indoorLoadCancelled) {
+            gltf.scene.traverse((node) => {
+              const mesh = node as THREE.Mesh;
+              if (mesh.geometry) mesh.geometry.dispose();
+              const materials = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
+              materials.forEach((material) => material.dispose());
+            });
+            return;
+          }
+          gltf.scene.traverse((node) => {
+            const mesh = node as THREE.Mesh;
+            if (!mesh.isMesh) return;
+            const materials = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
+            // Indoor picking must work from either side of thin Blender surfaces.
+            materials.forEach((material) => { material.side = THREE.DoubleSide; });
+            indoorPickMeshes.push(mesh);
+          });
+          indoorStaticGroup.add(gltf.scene);
+          indoorStaticGroup.updateMatrixWorld(true);
+          setPreviewProgress({ loaded: 1, total: 1, refined: 0, streaming: false });
+        },
+        (event) => {
+          if (!indoorLoadCancelled && event.total > 0) {
+            setPreviewProgress({ loaded: Math.min(0.99, event.loaded / event.total), total: 1, refined: 0, streaming: true });
+          }
+        },
+        (error) => {
+          if (!indoorLoadCancelled) {
+            console.error('Could not load selected indoor GLB into the shared simulator', error);
+            setPreviewProgress({ loaded: 0, total: 1, refined: 0, streaming: false });
+          }
+        },
+      );
+    }
+
+    // 10. ANCHORED RAYCAST EVENT LISTENER (outdoor or indoor scene surfaces)
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
 
     function handleContainerClick(e: MouseEvent) {
       const current = stateRef.current;
-      if (current.placementMode === 'none' && !(current.activeMode === 'playback' && current.pathDrawingMode)) return;
+      if (deviceTransformControls.dragging) return;
+      if (current.placementMode === 'none' && !(current.activeMode === 'playback' && current.pathDrawingMode) && !current.indoorScene) return;
 
       // Calculate mouse canvas click coords
       const rect = renderer.domElement.getBoundingClientRect();
@@ -2095,7 +2458,75 @@ export function ThreeStudio({
 
       raycaster.setFromCamera(mouse, camera);
 
-      // Target buildings first for roof placement, fallback to ground slab
+      if (current.indoorScene) {
+        if (current.activeMode === 'playback' && current.pathDrawingMode) {
+          const hits = raycaster.intersectObjects(indoorPickMeshes, true);
+          const floorHit = hits.find((hit) => {
+            if (!hit.face) return false;
+            const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
+            const normal = hit.face.normal.clone().applyMatrix3(normalMatrix).normalize();
+            if (normal.dot(raycaster.ray.direction) > 0) normal.negate();
+            return classifyIndoorSurface(normal) === 'floor';
+          });
+          if (!floorHit?.face) return;
+          const floorPosition = threeToCanonicalPosition(floorHit.point);
+          const bounds = current.indoorScene.canonicalBounds;
+          const minZ = Number(bounds?.minimum?.[2] ?? floorPosition[2]);
+          const maxZ = Number(bounds?.maximum?.[2] ?? floorPosition[2] + current.rx.height);
+          const headroom = Math.max(0, maxZ - floorPosition[2] - 0.05);
+          const receiverHeight = Math.min(Math.max(Number(current.indoorMobilityReceiverHeight) || 1.0, 0.1), headroom);
+          if (receiverHeight < 0.05) return;
+          current.setTrajectoryPoints([
+            ...current.trajectoryPoints.filter((point) => point.coordinateFrame === 'indoor_scene_local'),
+            {
+              lat: 0,
+              lon: 0,
+              coordinateFrame: 'indoor_scene_local',
+              enu: { x: floorPosition[0], y: floorPosition[1], z: Math.min(maxZ - 0.05, Math.max(minZ, floorPosition[2]) + receiverHeight) },
+            },
+          ]);
+          return;
+        }
+        if (current.placementMode === 'tx' || current.placementMode === 'rx') {
+          const hits = raycaster.intersectObjects(indoorPickMeshes, true);
+          const hit = hits[0];
+          if (!hit || !hit.face) return;
+          const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
+          const normalThree = hit.face.normal.clone().applyMatrix3(normalMatrix).normalize();
+          // Some CAD/Blender meshes have inconsistent winding. Orient the
+          // mounted device toward the side from which the user clicked.
+          if (normalThree.dot(raycaster.ray.direction) > 0) normalThree.negate();
+          const scenePosition = offsetCanonicalPosition(hit.point, normalThree, 0.045);
+          const sceneNormal = threeDirectionToCanonical(normalThree);
+          const sceneOrientation = surfaceNormalToCanonicalQuaternion(normalThree);
+          const sceneSurface = classifyIndoorSurface(normalThree);
+          if (current.placementMode === 'tx') {
+            const selectedId = current.activeTxId ?? current.tx.id;
+            selectedIndoorDeviceRef.current = { kind: 'tx', id: selectedId };
+            current.onTxUpdate({ ...current.tx, scenePosition, sceneNormal, sceneOrientation, sceneSurface, sceneSessionId: current.indoorScene.sessionId });
+          } else {
+            const selectedId = current.activeRxId ?? current.rx.id;
+            selectedIndoorDeviceRef.current = { kind: 'rx', id: selectedId };
+            current.onRxUpdate({ ...current.rx, scenePosition, sceneNormal, sceneOrientation, sceneSurface, sceneSessionId: current.indoorScene.sessionId });
+          }
+          current.setPlacementMode('none');
+          return;
+        }
+
+        // Select an existing compact marker; the attached gizmo then supports
+        // free translation and rotation in the shared 3D viewport.
+        const deviceHits = raycaster.intersectObjects(indoorDevicePickables, false);
+        const picked = deviceHits[0]?.object;
+        if (picked?.userData.deviceId && picked?.userData.deviceKind) {
+          const id = String(picked.userData.deviceId);
+          const kind = picked.userData.deviceKind as 'tx' | 'rx';
+          selectedIndoorDeviceRef.current = { kind, id };
+          if (kind === 'tx') current.onSelectTx(id); else current.onSelectRx(id);
+        }
+        return;
+      }
+
+      // Outdoor path remains unchanged: target OSM buildings first, then ground.
       const intersects = raycaster.intersectObjects([ground, ...buildingPickMeshes], true);
 
       if (intersects.length > 0) {
@@ -2187,12 +2618,20 @@ export function ThreeStudio({
         const nextMeasurementKey = nextMeasurements.map((point) => point.id).sort().join('|');
         setHoveredMeasurementPoints((previous) => previous.map((point) => point.id).sort().join('|') === nextMeasurementKey ? previous : nextMeasurements);
 
-        const intersects = raycaster.intersectObjects([ground, ...buildingPickMeshes], true);
-
+        const current = stateRef.current;
         let next: ENUVector | null = null;
-        if (intersects.length > 0) {
-          const hitPt = intersects[0].point;
-          next = { x: hitPt.x, y: -hitPt.z, z: rooftopHeightAt({ x: hitPt.x, y: -hitPt.z }) };
+        if (current.indoorScene) {
+          const indoorHits = raycaster.intersectObjects(indoorPickMeshes, true);
+          if (indoorHits.length > 0) {
+            const local = threeToCanonicalPosition(indoorHits[0].point);
+            next = { x: local[0], y: local[1], z: local[2] };
+          }
+        } else {
+          const intersects = raycaster.intersectObjects([ground, ...buildingPickMeshes], true);
+          if (intersects.length > 0) {
+            const hitPt = intersects[0].point;
+            next = { x: hitPt.x, y: -hitPt.z, z: rooftopHeightAt({ x: hitPt.x, y: -hitPt.z }) };
+          }
         }
         // The HUD displays one decimal place; avoid scheduling React updates
         // for pointer jitter that cannot change the visible text.
@@ -2230,6 +2669,7 @@ export function ThreeStudio({
       if (first || c.tx !== p.tx || c.rx !== p.rx || c.txs !== p.txs || c.rxs !== p.rxs ||
           c.activeTxId !== p.activeTxId || c.activeRxId !== p.activeRxId ||
           c.activeMode !== p.activeMode || c.mobilityRxPosition !== p.mobilityRxPosition ||
+          c.freqGhz !== p.freqGhz || c.solverOptions !== p.solverOptions ||
           c.showOutlines !== p.showOutlines) {
         drawNodes3D();
       }
@@ -2255,7 +2695,7 @@ export function ThreeStudio({
         // Clearing the selection removes the locator without moving the camera.
         drawRadioMap3D();
       }
-      if (first || c.trajectoryPoints !== p.trajectoryPoints) drawTrajectory3D();
+      if (first || c.trajectoryPoints !== p.trajectoryPoints || c.mobilityRxPosition !== p.mobilityRxPosition || c.activeMode !== p.activeMode) drawTrajectory3D();
       const overlayPointsChanged = first || c.measurementOverlayPoints !== p.measurementOverlayPoints;
       if (overlayPointsChanged || c.measurementOverlayVisible !== p.measurementOverlayVisible || c.anchor !== p.anchor) {
         drawMeasurementOverlay3D();
@@ -2282,7 +2722,7 @@ export function ThreeStudio({
 
       // Camera dynamic lock mode
       const current = stateRef.current;
-      if (current.cameraMode === 'lockTx') {
+      if (!current.indoorScene && current.cameraMode === 'lockTx') {
         const txPos = enuToThree({ ...current.tx.enu, z: current.tx.height });
         controls.target.lerp(txPos, 0.1);
       }
@@ -2381,6 +2821,7 @@ export function ThreeStudio({
     };
 
     return () => {
+      indoorLoadCancelled = true;
       previewBuildGeneration++;
       captureScreenshotRef.current = null;
       focusMeasurementOverlayRef.current = null;
@@ -2391,9 +2832,13 @@ export function ThreeStudio({
       renderer.domElement.removeEventListener('click', handleContainerClick);
       renderer.domElement.removeEventListener('mousemove', handleMouseMove);
       controls.dispose();
+      deviceTransformControls.detach();
+      deviceTransformControls.dispose();
+      scene.remove(transformHelper);
+      if (transformControlsRef.current === deviceTransformControls) transformControlsRef.current = null;
       // Release every GPU resource this effect created.
       [buildingGroup, streetLabelGroup, transmitterGroup, receiverGroup, pathsGroup,
-       heatmapGroup, trajectoryGroup, measurementGroup, interactionGroup].forEach(clearGroup);
+       heatmapGroup, trajectoryGroup, measurementGroup, interactionGroup, indoorStaticGroup].forEach(clearGroup);
       ground.geometry.dispose();
       groundMat.dispose();
       gridHelper.geometry.dispose();
@@ -2401,7 +2846,7 @@ export function ThreeStudio({
       renderer.dispose();
       if (rendererRef.current === renderer) rendererRef.current = null;
     };
-  }, [buildings]);
+  }, [buildings, indoorScene?.sessionId, indoorScene?.previewUrl]);
 
   // Quality-mode changes update the existing WebGL renderer in place. The
   // previous implementation re-created the entire renderer and rebuilt every
@@ -2433,13 +2878,13 @@ export function ThreeStudio({
           </div>
           <p className="text-[13px] text-slate-500 font-mono">
             {hoveredCoordinate
-              ? `ENU m: E ${hoveredCoordinate.x.toFixed(1)}, N ${hoveredCoordinate.y.toFixed(1)}, Alt ${hoveredCoordinate.z.toFixed(1)}`
+              ? `${indoorScene ? 'Scene-local' : 'ENU'} m: X ${hoveredCoordinate.x.toFixed(1)}, Y ${hoveredCoordinate.y.toFixed(1)}, Z ${hoveredCoordinate.z.toFixed(1)}`
               : 'Hover to raycast coordinates'}
           </p>
           {(placementMode !== 'none' || (pathDrawingMode && activeMode === 'playback')) && (
             <div className="mt-2 text-[12px] py-1 px-2.5 bg-[#cc785c]/10 text-[#cc785c] animate-pulse rounded border border-[#cc785c]/30 font-semibold flex items-center gap-1.5">
               <Compass className="w-3.5 h-3.5 rotate-45" />
-              <span>{pathDrawingMode && activeMode === 'playback' ? 'Click canvas to add path waypoint' : `Click canvas to place ${placementMode.toUpperCase()}`}</span>
+              <span>{pathDrawingMode && activeMode === 'playback' ? indoorScene ? 'Click room floor to add RX waypoint' : 'Click canvas to add path waypoint' : `Click canvas to place ${placementMode.toUpperCase()}`}</span>
             </div>
           )}
         </div>
@@ -2526,7 +2971,7 @@ export function ThreeStudio({
             )}
             <button
               id="btn-place-tx"
-              title="Click to place Transmitter antenna node over map"
+              title={indoorScene ? 'Click an indoor mesh surface to place the selected transmitter' : 'Click to place Transmitter antenna node over map'}
               onClick={() => setPlacementMode(placementMode === 'tx' ? 'none' : 'tx')}
               className={cn(
                 "px-3.5 py-1.5 text-[12px] font-bold rounded flex items-center gap-1.5  transition-all shadow-sm cursor-pointer border",
@@ -2536,12 +2981,12 @@ export function ThreeStudio({
               )}
             >
               <span className="w-1.5 h-1.5 rounded-full bg-[#cc785c] animate-ping" />
-              Place TX Antenna
+              {indoorScene ? 'Place TX' : 'Place TX Antenna'}
             </button>
 
             <button
               id="btn-place-rx"
-              title="Click to place Receiver device terminal node"
+              title={indoorScene ? 'Click an indoor mesh surface to place the selected receiver' : 'Click to place Receiver device terminal node'}
               onClick={() => setPlacementMode(placementMode === 'rx' ? 'none' : 'rx')}
               className={cn(
                 "px-3.5 py-1.5 text-[12px] font-bold rounded flex items-center gap-1.5  transition-all shadow-sm cursor-pointer border",
@@ -2551,8 +2996,27 @@ export function ThreeStudio({
               )}
             >
               <span className="w-1.5 h-1.5 rounded-full bg-[#6d939e] animate-pulse" />
-              Place RX Device
+              {indoorScene ? 'Place RX' : 'Place RX Device'}
             </button>
+
+            {indoorScene && (
+              <>
+                <span className="mx-1 h-5 w-px bg-slate-200" />
+                <button
+                  type="button"
+                  title="Move the selected indoor TX/RX device"
+                  onClick={() => { transformModeRef.current = 'translate'; setDeviceTransformMode('translate'); transformControlsRef.current?.setMode('translate'); }}
+                  className={cn("px-2.5 py-1.5 text-[11px] font-bold rounded border transition", deviceTransformMode === 'translate' ? 'bg-sky-50 text-sky-700 border-sky-300' : 'bg-white text-slate-600 border-slate-200')}
+                >Move</button>
+                <button
+                  type="button"
+                  title="Rotate the selected indoor TX/RX device"
+                  onClick={() => { transformModeRef.current = 'rotate'; setDeviceTransformMode('rotate'); transformControlsRef.current?.setMode('rotate'); }}
+                  className={cn("px-2.5 py-1.5 text-[11px] font-bold rounded border transition", deviceTransformMode === 'rotate' ? 'bg-sky-50 text-sky-700 border-sky-300' : 'bg-white text-slate-600 border-slate-200')}
+                >Rotate</button>
+                <span className="text-[10px] text-slate-500 px-1">Select a marker, then drag its gizmo</span>
+              </>
+            )}
 
             <button
               id="btn-export-scene-screenshot"
@@ -2583,7 +3047,7 @@ export function ThreeStudio({
               <>
                 <button
                   id="btn-draw-3d-mobility-path"
-                  title="Click ground or rooftops in the 3D scene to add receiver trajectory waypoints"
+                  title={indoorScene ? "Click the room floor to add scene-local RX waypoints" : "Click ground or rooftops to add receiver trajectory waypoints"}
                   onClick={() => setPathDrawingMode(!pathDrawingMode)}
                   className={cn(
                     "px-3.5 py-1.5 text-[12px] font-bold rounded flex items-center gap-1.5  transition-all shadow-sm cursor-pointer border",

@@ -67,7 +67,23 @@ export interface BuildingFootprint {
   material: string; // e.g., 'itu_concrete', 'itu_glass', 'itu_brick'
 }
 
-export interface Transmitter {
+export type SceneLocalVector3 = [number, number, number];
+export type SceneLocalQuaternion = [number, number, number, number];
+export type SceneSurfaceKind = 'floor' | 'ceiling' | 'wall' | 'other';
+
+export interface IndoorDevicePlacement {
+  /** Canonical scene-local position in metres (right-handed, +Z up). */
+  scenePosition?: SceneLocalVector3;
+  /** Canonical scene-local surface normal at the placement point. */
+  sceneNormal?: SceneLocalVector3;
+  /** Canonical scene-local device orientation quaternion [x,y,z,w]. */
+  sceneOrientation?: SceneLocalQuaternion;
+  sceneSurface?: SceneSurfaceKind;
+  /** Prevents a pose from one imported room being reused in another room. */
+  sceneSessionId?: string;
+}
+
+export interface Transmitter extends IndoorDevicePlacement {
   id: string;
   name: string;
   latitude: number;
@@ -77,7 +93,11 @@ export interface Transmitter {
   powerDbm: number; // conducted TX power supplied to Sionna RT
   antennaArraySize: [number, number]; // [horizontal, vertical]
   beamsteeringAzimuth: number; // degrees clockwise from North
-  beamsteeringElevation: number; // degrees above horizon; negative = downtilt
+  beamsteeringElevation: number; // degrees above horizon (outdoor) or local boresight offset (indoor)
+  /** Indoor steering is expressed in the device-local frame; outdoor remains world ENU. */
+  beamSteeringFrame?: 'device_local' | 'world_enu';
+  /** Indoor-only steering offsets; keeps legacy outdoor compass angles intact. */
+  indoorBeamSteering?: { azimuthDeg: number; elevationDeg: number };
   // Optional base-station metadata. Legacy/manual TX objects remain valid.
   site?: string;
   transmitterLabel?: string;
@@ -92,7 +112,7 @@ export interface Transmitter {
   electricalDowntiltDeg?: number;
 }
 
-export interface Receiver {
+export interface Receiver extends IndoorDevicePlacement {
   id: string;
   name: string;
   latitude: number;
@@ -400,6 +420,8 @@ export interface TrajectoryPoint {
   lat: number;
   lon: number;
   enu: ENUVector;
+  /** Indoor points store canonical scene-local XYZ metres, not geographic ENU. */
+  coordinateFrame?: 'outdoor_enu' | 'indoor_scene_local';
 }
 
 // One solved Tx→Rx pair in the all-pairs link matrix.

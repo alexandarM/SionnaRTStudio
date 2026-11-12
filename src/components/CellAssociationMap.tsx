@@ -14,6 +14,7 @@ export type AssociationLayer = 'rss' | 'sinr' | 'path_gain' | 'interferer';
 interface CellAssociationMapProps {
   radioMap: RadioMapGrid;
   txs: Transmitter[];
+  indoorMode?: boolean;
   layer: AssociationLayer;
   selectedCellIndex: number | null;
   onSelectCell: (cellIndex: number) => void;
@@ -37,7 +38,7 @@ function associationForLayer(cell: RadioMapGrid['cells'][number], layer: Associa
 }
 
 export function CellAssociationMap({
-  radioMap, txs, layer, selectedCellIndex, onSelectCell,
+  radioMap, txs, layer, selectedCellIndex, onSelectCell, indoorMode = false,
 }: CellAssociationMapProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const transformRef = useRef<CanvasTransform | null>(null);
@@ -112,8 +113,11 @@ export function CellAssociationMap({
         const tx = txs.find((candidate) => candidate.id === stats.txId);
         if (!tx) return;
         const txIndex = stats.txIndex;
-        const px = x0 + (tx.enu.x - radioMap.minX) * scale;
-        const py = y0 + mapHeight - (tx.enu.y - radioMap.minY) * scale;
+        const txX = indoorMode ? tx.scenePosition?.[0] : tx.enu.x;
+        const txY = indoorMode ? tx.scenePosition?.[1] : tx.enu.y;
+        if (!Number.isFinite(txX) || !Number.isFinite(txY)) return;
+        const px = x0 + ((txX as number) - radioMap.minX) * scale;
+        const py = y0 + mapHeight - ((txY as number) - radioMap.minY) * scale;
         if (!Number.isFinite(px) || !Number.isFinite(py) || px < x0 - 20 || px > x0 + mapWidth + 20 || py < y0 - 20 || py > y0 + mapHeight + 20) return;
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth = 5;
@@ -135,11 +139,11 @@ export function CellAssociationMap({
       ctx.fillStyle = '#475569';
       ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
       ctx.textAlign = 'center';
-      ctx.fillText(`East · ${radioMap.minX.toFixed(0)} to ${radioMap.maxX.toFixed(0)} m`, cssWidth / 2, cssHeight - 8);
+      ctx.fillText(`${indoorMode ? 'Scene X' : 'East'} · ${radioMap.minX.toFixed(2)} to ${radioMap.maxX.toFixed(2)} m`, cssWidth / 2, cssHeight - 8);
       ctx.save();
       ctx.translate(12, cssHeight / 2);
       ctx.rotate(-Math.PI / 2);
-      ctx.fillText(`North · ${radioMap.minY.toFixed(0)} to ${radioMap.maxY.toFixed(0)} m`, 0, 0);
+      ctx.fillText(`${indoorMode ? 'Scene Y' : 'North'} · ${radioMap.minY.toFixed(2)} to ${radioMap.maxY.toFixed(2)} m`, 0, 0);
       ctx.restore();
       if (selected) {
         ctx.textAlign = 'right';
@@ -153,7 +157,7 @@ export function CellAssociationMap({
     const observer = new ResizeObserver(render);
     observer.observe(parent);
     return () => observer.disconnect();
-  }, [radioMap, txs, layer, selectedCellIndex]);
+  }, [radioMap, txs, layer, selectedCellIndex, indoorMode]);
 
   const handleCanvasClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -216,7 +220,7 @@ export function CellAssociationMap({
           Unassociated
         </div>
       </div>
-      <p className="text-[9px] leading-relaxed text-slate-500">Colours use the same deterministic TX-index palette as the 3D categorical radio-map. This is an association diagram, not a continuous RSS/SINR heatmap.</p>
+      <p className="text-[9px] leading-relaxed text-slate-500">Colours use the same deterministic TX-index palette as the 3D categorical radio-map. {indoorMode ? 'Axes are canonical scene-local X/Y in metres.' : 'Axes are local ENU East/North in metres.'} This is an association diagram, not a continuous RSS/SINR heatmap.</p>
     </div>
   );
 }

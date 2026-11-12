@@ -29,7 +29,9 @@ interface LinkPanelProps {
   onSolve: () => void;
   solving: boolean;
   solveError: string;
+  solveInfo?: string;
   backendOnline: boolean;
+  indoorMode?: boolean;
 }
 
 // Channel Impulse Response Taps Chart
@@ -37,7 +39,7 @@ function CIRChart({ paths }: { paths: PropagationPath[] }) {
   if (paths.length === 0) {
     return (
       <div className="h-[140px] flex items-center justify-center bg-slate-50 border border-slate-100 rounded-lg text-slate-600 text-[14px]">
-        No multipaths resolved. Fetch an OSM area.
+        No propagation paths resolved for the current link.
       </div>
     );
   }
@@ -141,7 +143,9 @@ export function LinkPanel({
   onSolve,
   solving,
   solveError,
+  solveInfo = '',
   backendOnline,
+  indoorMode = false,
 }: LinkPanelProps) {
   return (
     <div className="panel p-4 flex flex-col gap-4">
@@ -183,9 +187,16 @@ export function LinkPanel({
           {solveError}
         </div>
       )}
-      {paths.length === 0 && !solving && !solveError && (
+      {solveInfo && !solveError && (
+        <div className="text-[12px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-2.5 py-1.5 font-mono" data-testid="path-solver-execution-status">
+          {solveInfo}
+        </div>
+      )}
+      {paths.length === 0 && !solving && !solveError && !solveInfo && (
         <div className="text-[12px] text-slate-600 text-center -mt-1">
-          Place Tx/Rx and press <strong className="text-[#cc785c]">Solve Link</strong> to run GPU ray tracing.
+          {indoorMode
+            ? <>Synchronize the placed indoor TX/RX devices in Scene Import, then press <strong className="text-[#cc785c]">Solve Link</strong> to run PathSolver on the active classroom scene.</>
+            : <>Place Tx/Rx and press <strong className="text-[#cc785c]">Solve Link</strong> to run GPU ray tracing.</>}
         </div>
       )}
 
@@ -235,7 +246,7 @@ export function LinkPanel({
             className="w-full bg-[#ebe7dc] hover:bg-[#e3e0d6] disabled:opacity-50 text-slate-900 text-[13px] font-bold py-2 px-3 rounded uppercase tracking-widest flex items-center justify-center gap-2 transition cursor-pointer border border-[#e3e0d6]"
           >
             <Activity className={`w-3.5 h-3.5 ${matrixLoading ? 'animate-spin' : ''}`} />
-            {matrixLoading ? (matrixProgress || 'Solving matrix…') : 'Solve All Pairs · Sionna RT'}
+            {matrixLoading ? (matrixProgress || 'Solving matrix…') : indoorMode ? 'Solve All Indoor Pairs · Sionna RT' : 'Solve All Pairs · Sionna RT'}
           </button>
 
           {Object.keys(matrix).length > 0 && (

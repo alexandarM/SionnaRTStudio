@@ -6,15 +6,15 @@ This is the public fork [alexandarM/SionnaRTStudio](https://github.com/alexandar
 
 ## Recommended: launch with Google Colab
 
-Use the included [`SionnaRTStudio_Colab_Launcher.ipynb`](SionnaRTStudio_Colab_Launcher.ipynb).
+Use the included [`SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb`](SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb).
 
 1. Open the notebook in Google Colab.
-2. In **Repository configuration**, the repository is already configured as `alexandarM/SionnaRTStudio` on the `main` branch. Change it only if you intentionally want to launch another fork or branch.
-3. Select **Runtime → Change runtime type → GPU** when an NVIDIA GPU is available. CPU/LLVM fallback may work but can be significantly slower.
-4. Run the notebook cells from top to bottom. The launcher checks the runtime, installs system packages, clones the configured fork, prepares a virtual environment, runs `setup.sh`, performs selected checks, starts the backend and frontend, and displays the Colab proxy link.
-5. Import an OpenStreetMap scene and, when needed, load field-measurement CSV files in the application.
+2. Select **Runtime → Change runtime type → GPU** when an NVIDIA GPU is available. CPU/LLVM fallback may work but can be significantly slower.
+3. Upload one complete SionnaRTStudio source ZIP for the phase you want to test. The notebook does not clone GitHub or run `git pull`.
+4. Run the notebook cells from top to bottom. It installs the uploaded source, discovers all `check:*` scripts, runs backend pytest, TypeScript checks and the Vite production build, starts the backend/frontend, and displays the Colab proxy link.
+5. Import the classroom `exported.zip` or an OpenStreetMap scene through the application UI, as appropriate.
 
-The notebook can optionally mount Google Drive and store the SQLite experiment database in a persistent Drive folder. This keeps experiment history and configuration presets across runtime resets. Imported field-measurement datasets are currently held in memory and must be imported again after a backend restart.
+Use the same ZIP-only notebook for every phase. Upload a new complete source ZIP when moving to the next phase; do not create or use a separate per-phase notebook.
 
 The NR PHY dependency set is optional and separate. Enable `INSTALL_OPTIONAL_PHY` in the notebook only when you need the NR PUSCH BER/BLER workflow; the package set is large and requires additional disk space.
 
@@ -51,7 +51,7 @@ Then open `http://localhost:3000`. See [`README.md`](README.md) for system requi
 ## Documentation
 
 - [`README.md`](README.md) — full overview, installation, usage, architecture, tests, and troubleshooting.
-- [`SionnaRTStudio_Colab_Launcher.ipynb`](SionnaRTStudio_Colab_Launcher.ipynb) — interactive Colab launcher.
+- [`SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb`](SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb) — interactive Colab launcher.
 - [`docs/GOOGLE_COLAB_LAUNCHER.md`](docs/GOOGLE_COLAB_LAUNCHER.md) — launcher setup and persistence details.
 - [`FORK_AND_ATTRIBUTION.md`](FORK_AND_ATTRIBUTION.md) — upstream origin, fork-specific additions, and citation guidance.
 - [`GITHUB_PUBLISHING_CHECKLIST.md`](GITHUB_PUBLISHING_CHECKLIST.md) — safe steps for applying this release to the existing GitHub fork and publishing it.

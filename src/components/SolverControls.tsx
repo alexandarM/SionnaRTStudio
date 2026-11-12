@@ -21,6 +21,8 @@ interface SolverControlsProps {
   setMaxDepth: (val: number) => void;
   solverOptions: SolverOptions;
   setSolverOptions: (opts: SolverOptions) => void;
+  /** Indoor device position/orientation is controlled by the 3D placement gizmo. */
+  indoorMode?: boolean;
 }
 
 // Studio mode tabs + the shared RF transceiver parameters (carrier, ray
@@ -39,6 +41,7 @@ export function SolverControls({
   setMaxDepth,
   solverOptions,
   setSolverOptions,
+  indoorMode = false,
 }: SolverControlsProps) {
   // Local RF simulation configs
   const [txPower, setTxPower] = useState(tx.powerDbm);
@@ -70,10 +73,11 @@ export function SolverControls({
     setTxPower(tx.powerDbm);
     setTxAntH(tx.antennaArraySize[0]);
     setTxAntV(tx.antennaArraySize[1]);
-    setBeamsteeringAz(tx.beamsteeringAzimuth);
-    setBeamsteeringEl(tx.beamsteeringElevation);
+    // Indoor steering is stored separately from the outdoor ENU bearing.
+    setBeamsteeringAz(indoorMode ? (tx.indoorBeamSteering?.azimuthDeg ?? 0) : tx.beamsteeringAzimuth);
+    setBeamsteeringEl(indoorMode ? (tx.indoorBeamSteering?.elevationDeg ?? 0) : tx.beamsteeringElevation);
     setTxHeight(tx.height);
-  }, [tx.id]);
+  }, [tx.id, indoorMode]);
 
   useEffect(() => {
     setRxHeight(rx.height);
@@ -87,11 +91,19 @@ export function SolverControls({
       ...tx,
       powerDbm: txPower,
       antennaArraySize: [txAntH, txAntV],
-      beamsteeringAzimuth: beamsteeringAz,
-      beamsteeringElevation: beamsteeringEl,
+      ...(indoorMode
+        ? {
+            beamSteeringFrame: 'device_local' as const,
+            indoorBeamSteering: { azimuthDeg: beamsteeringAz, elevationDeg: beamsteeringEl },
+          }
+        : {
+            beamSteeringFrame: 'world_enu' as const,
+            beamsteeringAzimuth: beamsteeringAz,
+            beamsteeringElevation: beamsteeringEl,
+          }),
       height: txHeight,
     });
-  }, [txPower, txAntH, txAntV, beamsteeringAz, beamsteeringEl, txHeight]);
+  }, [txPower, txAntH, txAntV, beamsteeringAz, beamsteeringEl, txHeight, indoorMode]);
 
   useEffect(() => {
     onRxUpdate({
@@ -345,6 +357,7 @@ export function SolverControls({
           </div>
           <p className="col-span-2 text-[11px] text-slate-500 leading-snug">
             RX settings configure the physical <code>scene.rx_array</code> for Link, Trajectory, CIR/CFR, and ray-traced datasets. Coverage uses Sionna RadioMapSolver&apos;s ideal dual-polarized isotropic receiver.
+            {indoorMode && ' Sionna TX/RX array pattern and polarization are scene-level; all devices on the same side share these definitions.'}
           </p>
         </div>
 
@@ -422,48 +435,94 @@ export function SolverControls({
           </div>
 
           <div className="flex flex-col gap-1">
-            <span className="text-[12px] text-slate-600 font-bold">Beam Azimuth: {beamsteeringAz}°</span>
+            <span className="text-[12px] text-slate-600 font-bold">{indoorMode ? 'Local beam azimuth' : 'Beam azimuth'}: {beamsteeringAz}°</span>
             <input
               type="range"
               id="slider-beam-az"
-              min="0"
-              max="360"
-              step="5"
+              min={indoorMode ? -180 : 0}
+              max={indoorMode ? 180 : 360}
+              step={indoorMode ? 1 : 5}
               className="accent-[#cc785c] cursor-ew-resize"
-              value={beamsteeringAz}
+              value={indoorMode && beamsteeringAz > 180 ? beamsteeringAz - 360 : beamsteeringAz}
               onChange={(e) => setBeamsteeringAz(parseInt(e.target.value, 10))}
             />
           </div>
-
           <div className="flex flex-col gap-1">
-            <span className="text-[12px] text-slate-600 font-bold">TX Tower Height: {txHeight}m</span>
+            <span className="text-[12px] text-slate-600 font-bold">{indoorMode ? 'Local beam elevation' : 'Beam elevation'}: {beamsteeringEl}°</span>
             <input
               type="range"
-              id="slider-tx-height"
-              min="1"
-              max="40"
-              step="0.5"
+              id="slider-beam-el"
+              min="-90"
+              max="90"
+              step="1"
               className="accent-[#cc785c] cursor-ew-resize"
-              value={txHeight}
-              onChange={(e) => setTxHeight(parseFloat(e.target.value))}
+              value={beamsteeringEl}
+              onChange={(e) => setBeamsteeringEl(parseInt(e.target.value, 10))}
             />
           </div>
 
-          <div className="flex flex-col gap-1">
-            <span className="text-[12px] text-slate-600 font-bold">RX Device Height: {rxHeight}m</span>
-            <input
-              type="range"
-              id="slider-rx-height"
-              min="1"
-              max="10"
-              step="0.5"
-              className="accent-[#cc785c] cursor-ew-resize"
-              value={rxHeight}
-              onChange={(e) => setRxHeight(parseFloat(e.target.value))}
-            />
-          </div>
+          {!indoorMode ? (
+            <>
+              <div className="flex flex-col gap-1">
+                <span className="text-[12px] text-slate-600 font-bold">TX Tower Height: {txHeight}m</span>
+                <input
+                  type="range"
+                  id="slider-tx-height"
+                  min="1"
+                  max="40"
+                  step="0.5"
+                  className="accent-[#cc785c] cursor-ew-resize"
+                  value={txHeight}
+                  onChange={(e) => setTxHeight(parseFloat(e.target.value))}
+                />
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <span className="text-[12px] text-slate-600 font-bold">RX Device Height: {rxHeight}m</span>
+                <input
+                  type="range"
+                  id="slider-rx-height"
+                  min="1"
+                  max="10"
+                  step="0.5"
+                  className="accent-[#cc785c] cursor-ew-resize"
+                  value={rxHeight}
+                  onChange={(e) => setRxHeight(parseFloat(e.target.value))}
+                />
+              </div>
+            </>
+          ) : (
+            <div className="col-span-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-[11px] leading-snug text-sky-800">
+              Indoor TX/RX position, mounting height and orientation are set directly in the 3D scene with Place, Move and Rotate. Outdoor tower/AGL height offsets are not used for this scene.
+            </div>
+          )}
         </div>
       </div>
+
+      {indoorMode && (
+        <div className="panel p-3 flex flex-col gap-2" data-testid="indoor-antenna-rf-summary">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[12px] font-bold text-slate-700">Indoor antenna configuration</span>
+            <span className="text-[10px] font-mono text-slate-500">device-local frame</span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-[11px]">
+            <div className="rounded border border-[var(--line)] bg-[var(--surface)] p-2">
+              <div className="text-[var(--text-lo)]">TX · {txAntH} × {txAntV}</div>
+              <div className="font-mono font-semibold">{txAntH * txAntV} elements · {txAntH * txAntV * (solverOptions.txPolarization === 'VH' || solverOptions.txPolarization === 'cross' ? 2 : 1)} ports</div>
+              <div className="text-[var(--text-lo)]">Aperture {(Math.max(0, txAntH - 1) * 0.5 * 0.299792458 / Math.max(freqGhz, 0.001)).toFixed(3)} × {(Math.max(0, txAntV - 1) * 0.5 * 0.299792458 / Math.max(freqGhz, 0.001)).toFixed(3)} m</div>
+              <div className="text-[var(--text-lo)]">{solverOptions.txPattern} · {solverOptions.txPolarization}</div>
+              <div className="text-[var(--text-lo)]">Steering {beamsteeringAz}° / {beamsteeringEl}° local</div>
+            </div>
+            <div className="rounded border border-[var(--line)] bg-[var(--surface)] p-2">
+              <div className="text-[var(--text-lo)]">RX · {rxAntH} × {rxAntV}</div>
+              <div className="font-mono font-semibold">{rxAntH * rxAntV} elements · {rxAntH * rxAntV * (solverOptions.rxPolarization === 'VH' || solverOptions.rxPolarization === 'cross' ? 2 : 1)} ports</div>
+              <div className="text-[var(--text-lo)]">Aperture {(Math.max(0, rxAntH - 1) * 0.5 * 0.299792458 / Math.max(freqGhz, 0.001)).toFixed(3)} × {(Math.max(0, rxAntV - 1) * 0.5 * 0.299792458 / Math.max(freqGhz, 0.001)).toFixed(3)} m</div>
+              <div className="text-[var(--text-lo)]">{solverOptions.rxPattern} · {solverOptions.rxPolarization}</div>
+            </div>
+          </div>
+          <p className="text-[10px] leading-snug text-[var(--text-lo)]">Element spacing: 0.5λ ({(0.5 * 0.299792458 / Math.max(freqGhz, 0.001)).toFixed(3)} m at {freqGhz} GHz). The viewport shows antenna element positions and a TX steering-axis indicator, not a simulated radiation/gain pattern. Indoor beam angles are offsets relative to the mounted device boresight. Sionna uses one scene-level TX array and one scene-level RX array per solve; multi-device solves require compatible array dimensions as well as shared pattern/polarization.</p>
+        </div>
+      )}
     </div>
   );
 }

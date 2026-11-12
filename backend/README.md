@@ -4,7 +4,10 @@ A minimal FastAPI service that runs **real NVIDIA Sionna RT** ray tracing for th
 React frontend. It builds a Sionna/Mitsuba scene from the building footprints the
 frontend sends (ENU meters) and returns paths / coverage in the exact shapes the
 frontend already uses (`src/types.ts`). Scenes are cached by a geometry hash, so
-consecutive solves over the same area reuse one build.
+consecutive solves over the same area reuse one build. Imported Mitsuba scenes
+have a separate staged-session cache, content/coordinate-profile deduplication,
+backend-process rehydration and LRU/TTL cleanup; they are not activated in the
+Sionna RT runtime until a later integration phase.
 
 ## Requirements
 
@@ -53,6 +56,12 @@ Sionna scene build, no network:
 | GET    | `/api/phyber/{jobId}` | —                                                     | job status + BER/BLER points |
 | POST   | `/api/channel-grid` | Tx/Rx arrays + receiver cells + OFDM grid               | ray-traced MIMO CFR `.npz` |
 | POST   | `/api/scene-export` | buildings + optional devices + OFDM grid                | ZIP: `scene.xml`, `meshes/*.ply`, `load_scene.py`, manifest |
+| POST   | `/api/scene/import/preview` | raw Mitsuba scene ZIP + explicit coordinate profile | staged scene manifest + canonical GLB preview metadata |
+| GET    | `/api/scene/import/sessions` | — | staged session history + cache policy/status |
+| GET    | `/api/scene/import/{sessionId}` | — | full staged-scene manifest |
+| POST   | `/api/scene/import/{sessionId}/select` | — | mark one staged scene as current (not Sionna activation) |
+| DELETE | `/api/scene/import/selection` | — | clear current staged-scene selection |
+| DELETE | `/api/scene/import/{sessionId}` | — | delete one staged scene and its cached resources |
 
 `options` (all endpoints) selects the ray interaction types and both scene arrays:
 

@@ -26,19 +26,21 @@
 
 **This repository is the `alexandarM/SionnaRTStudio` fork of the original [`puloktarafder/SionnaRTStudio`](https://github.com/puloktarafder/SionnaRTStudio).** The upstream author and Apache-2.0 notices are retained; this fork adds research workflows and a dedicated Google Colab launcher. See [Fork origin and attribution](#fork-origin-and-attribution).
 
-**SionnaRTStudio** turns any real-world location into an interactive wireless propagation
-sandbox. Pick an area on a map, pull its buildings from **OpenStreetMap**, place
-transmitters and receivers inside a 3D digital twin, and run **NVIDIA
-[Sionna RT](https://github.com/NVlabs/sionna-rt)** GPU ray tracing — multipath links,
+**SionnaRTStudio** is a browser-based wireless digital-twin workspace for both
+outdoor and indoor propagation studies. For outdoor scenarios, select an area,
+load buildings from **OpenStreetMap**, place transmitters and receivers in the
+3D scene, and run **NVIDIA [Sionna RT](https://github.com/NVlabs/sionna-rt)**
+GPU ray tracing. For indoor scenarios, import a Mitsuba XML/ZIP scene, activate
+it as the Sionna scene, and run link, coverage, mobility, and channel-response
+analyses in its local coordinate frame. The workspace includes multipath links,
 coverage maps, multi-transmitter receiver mobility with 3GPP A3 handover analysis,
-Shannon-capacity link KPIs, an optional standard-compliant 5G NR PUSCH BER/BLER
-chain, and notebook-grade channel-response exports (CIR / CFR) — all from the
-browser.
+Shannon-capacity link KPIs, an optional 5G NR PUSCH BER/BLER chain, and
+CIR/CFR analysis and exports.
 
-> **Google Colab support:** use the included [Colab Launcher notebook](SionnaRTStudio_Colab_Launcher.ipynb), or open it directly in Colab with the badge below.
-> The launcher clones the configured fork, installs the project dependencies, checks the backend/frontend health endpoints, opens the Colab port proxy, and can store the experiment database on Google Drive.
+> **Google Colab support:** use the included [ZIP-only Colab Launcher notebook](SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb), or open it directly in Colab with the badge below.
+> Upload one complete SionnaRTStudio source ZIP. The notebook does not clone GitHub or pull source code; it installs the uploaded archive, discovers all `check:*` project checks, runs backend/frontend validation and starts the app through the Colab port proxy.
 >
-> [![Open in Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/alexandarM/SionnaRTStudio/blob/main/SionnaRTStudio_Colab_Launcher.ipynb)
+> [![Open in Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/alexandarM/SionnaRTStudio/blob/main/SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb)
 >
 > **New to SionnaRTStudio?** Follow the
 > **[upstream step-by-step tutorial by Pulok Tarafder](https://puloktarafder.github.io/posts/2026/08/sionnartstudio-tutorial/)**
@@ -56,6 +58,8 @@ browser.
   - [How Node is resolved](#how-node-is-resolved)
 - [Google Colab notebook support](#google-colab-notebook-support)
 - [Features](#features)
+  - [Indoor / arbitrary Mitsuba scene import](#indoor-simulation-experimental)
+- [Indoor scene development (experimental)](#indoor-scene-development-experimental)
 - [Architecture](#architecture)
 - [City-scale preview streaming and LOD](#city-scale-preview-streaming-and-lod)
 - [Using it](#using-it)
@@ -132,25 +136,15 @@ SRTS_NODE_INSTALL=off ./setup.sh
 
 ## Google Colab notebook support
 
-SionnaRTStudio includes a dedicated launcher notebook: [`SionnaRTStudio_Colab_Launcher.ipynb`](SionnaRTStudio_Colab_Launcher.ipynb).
+SionnaRTStudio includes a dedicated launcher notebook: [`SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb`](SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb).
 
-[Launch the notebook in Google Colab](https://colab.research.google.com/github/alexandarM/SionnaRTStudio/blob/main/SionnaRTStudio_Colab_Launcher.ipynb)
+[Launch the notebook in Google Colab](https://colab.research.google.com/github/alexandarM/SionnaRTStudio/blob/main/SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb)
 
-The notebook is preconfigured for [`alexandarM/SionnaRTStudio`](https://github.com/alexandarM/SionnaRTStudio) on the `main` branch. You can change the repository and branch in the first configuration cell when running a different fork.
+The ZIP-only notebook is designed for a fresh Colab runtime and accepts one complete SionnaRTStudio source ZIP uploaded by the user. It does not clone GitHub, run `git pull`, or require a GitHub connection. Use a complete SionnaRTStudio source archive; do not upload the indoor classroom `exported.zip` as the source archive (that file is imported later through the Scene Import UI).
 
-The launcher is designed for a fresh Colab runtime and provides:
+The launcher detects the Colab runtime and available NVIDIA GPU, installs system and Python/frontend dependencies from the uploaded source, discovers and executes every `check:*` script in `package.json`, runs backend pytest, full TypeScript checks and the Vite production build, and only then starts the application and checks `/api/health`. It preserves runtime directories in the Colab project folder where configured by the notebook, but the Colab runtime itself remains temporary.
 
-- Runtime and NVIDIA GPU detection, plus installation of required system packages.
-- A configurable clone of this fork and its selected branch (it does not silently clone the upstream project).
-- A Python virtual-environment check and a Colab-specific interpreter preference fix before invoking the repository's `setup.sh`.
-- Setup logging, backend/frontend health checks, and a clickable Colab port-proxy link.
-- Optional installation of the separate NR PHY dependency set for PUSCH BER/BLER experiments.
-- Optional Google Drive persistence for the SQLite experiment database. Imported field-measurement datasets remain in memory and must be imported again after a backend/runtime restart.
-- Optional test, TypeScript, and production-build checks after installation.
-
-Open the notebook in Colab and review the repository and branch in the first configuration cell (preconfigured for `alexandarM/SionnaRTStudio` on `main`). Choose a GPU runtime if available, then execute the cells from top to bottom. A GPU is recommended for ray tracing; CPU/LLVM fallback may be considerably slower. Colab runtimes are temporary and are not a replacement for a persistent server.
-
-The launcher uses the repository's installation and runtime scripts; it does not modify the upstream repository. Its only runtime compatibility adjustment is local to the Colab checkout and prioritizes a Python interpreter that has passed a virtual-environment/pip smoke test.
+Choose a GPU runtime when available, then execute the cells from top to bottom. A GPU is recommended for ray tracing; CPU/LLVM fallback may be considerably slower. The same ZIP-only notebook can be reused across development and testing; project-specific `check:*` scripts are discovered from the uploaded archive, so no separate notebook is needed for different workflows.
 
 ### Windows (WSL2)
 
@@ -231,13 +225,16 @@ Node, or to force a re-download on the next `setup.sh`.
 
 ## Features
 
-- **Google Colab launcher** — a dedicated notebook that clones the configured fork, prepares the Colab runtime, installs dependencies, checks backend/frontend health, exposes the UI through the Colab port proxy, and optionally persists experiment history on Google Drive. See [`SionnaRTStudio_Colab_Launcher.ipynb`](SionnaRTStudio_Colab_Launcher.ipynb).
+- **Google Colab ZIP-only launcher** — a reusable notebook that runs a user-uploaded source ZIP without GitHub clone/pull, automatically executes all `check:*` project checks plus backend tests, TypeScript and Vite build, and then exposes the UI through the Colab port proxy. See [`SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb`](SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb).
+- **Universal scene-coordinate adapter** — imported scene sources explicitly describe signed up/forward axes, handedness, units, and origin; coordinate previews map the source frame into a canonical right-handed, metre-based Sionna frame without assuming Y-up or Z-up for every source.
+- **Mitsuba XML/ZIP Scene Import + Persistent Scene Manager** — upload one XML scene with referenced PLY/OBJ/STL/OFF meshes and textures, validate archive paths/resources, inspect per-object geometry and material inventories, and orbit a canonical-coordinate GLB preview. Identical archive/coordinate-profile imports reuse the same staged session and preview; sessions can be restored after a browser refresh or backend-process restart while the cache directory remains available. Scene selection is deliberately non-activating and does not replace the active Sionna RT scene. See the indoor simulation section below for the supported scene workflow.
 - **GIS digital twin** — fetch building footprints, roads, parks, and water for any
   bounding box via the OpenStreetMap Overpass API; rendered as an interactive
   Three.js 3D scene with ITU radio materials per building.
-- **Link analysis** — GPU ray tracing between any Tx/Rx pair: multipath rays in 3D,
-  CIR taps, RX power, RMS delay spread, LOS/NLOS. Supports multiple transmitters
-  and receivers with an all-pairs link matrix.
+- **Link analysis** — GPU ray tracing between Tx/Rx pairs: multipath rays in 3D,
+  CIR taps, RX power, RMS delay spread, LOS/NLOS. Outdoor and indoor modes both
+  provide a Tx × Rx all-pairs matrix. Indoor mode extracts every combination
+  from one native PathSolver dispatch on the already-active imported scene.
 - **Beamforming** — configurable antenna array size, pattern (isotropic, dipole,
   half-wave dipole, 3GPP TR 38.901), polarization (V / H / VH / cross), and
   azimuth/elevation beamsteering that the solver genuinely applies.
@@ -245,24 +242,31 @@ Node, or to force a re-download on the next `setup.sh`.
   reflection, refraction, diffraction, and edge diffraction per solve
   (applies to links, mobility, and radio maps alike). PathSolver samples/source
   and seed are explicit, separately from radio-map Monte Carlo controls.
-- **Radio coverage maps** — Sionna `RadioMapSolver` with best-server combining
-  across transmitters; viridis/plasma/inferno/turbo colormaps with auto or
-  manual vmin/vmax range. Monte Carlo rays/Tx and a deterministic seed are
-  explicit controls and are returned with each grid for reproducibility.
-- **On-demand Channel Analysis** — select up to 12 exact cells from a
-  cached radio map (weak SINR, weak RSS, high interference, or manual indices),
-  then run one batched `PathSolver` pass for serving/interfering sectors. Inspect
-  per-link LOS/NLOS, paths, AoA/AoD, CIR taps, CFR magnitude/phase where defined,
-  RMS delay spread, Doppler, and a ray-tracing K-factor estimate. The original
-  map scene context is replayed and the Tx–Rx batch is bounded.
+- **Radio coverage maps** — Sionna `RadioMapSolver` for outdoor OSM scenes and
+  activated indoor scenes, with best-server combining across transmitters;
+  viridis/plasma/inferno/turbo colormaps with auto or manual vmin/vmax range.
+  Monte Carlo rays/Tx and a deterministic seed are explicit controls and are
+  returned with each grid for reproducibility. Indoor maps use the active scene's
+  canonical local metre coordinates and a configurable map-plane height; they do
+  not use an outdoor geographic anchor.
+- **On-demand Channel Analysis** — select up to 12 exact cells from a cached
+  radio map (weak SINR, weak RSS, high interference, or manual indices), then run
+  one batched `PathSolver` pass for serving/interfering sectors. Inspect per-link
+  LOS/NLOS, paths, AoA/AoD, CIR taps, CFR magnitude/phase where defined, RMS delay
+  spread, Doppler, and a ray-tracing K-factor estimate. Outdoor analysis replays
+  the map's saved scene context. Indoor analysis uses the already-active imported Sionna scene, preserves its registered TX devices, and reports
+  canonical scene-local XYZ coordinates. A changed indoor TX/RF configuration
+  invalidates the cached map and requires a fresh RadioMap solve before analysis.
 - **Spatial Association & Geolocation** — inspect an interactive
   2D Cell-to-TX association diagram (RSS serving, best SINR, best path gain,
   dominant interferer) with stable per-sector colours, TX markers and a legend.
-  Click a cell to focus its marker in the 3D scene. Radio maps retain the WGS84
-  anchor used at solve time; cells and weak-link candidates display latitude /
-  longitude, offer Google Maps and clipboard actions, and export as geolocated
-  CSV. Weak-cell sampling can be restricted to an RSS-serving or best-SINR
-  sector footprint and use strict true Top-K or spatially distributed ranking.
+  Click a cell to focus its marker in the 3D scene. Outdoor radio maps retain the
+  WGS84 anchor used at solve time; cells and weak-link candidates display latitude /
+  longitude, offer Google Maps and clipboard actions, and export as geolocated CSV.
+  Indoor maps instead retain canonical scene-local metre coordinates and do not
+  imply latitude/longitude. Weak-cell sampling can be restricted to an RSS-serving
+  or best-SINR sector footprint and use strict true Top-K or spatially distributed
+  ranking.
 - **Mobility (multi-transmitter)** — draw a receiver trajectory in the 3D scene (or
   generate a loop), then ray-trace **every transmitter** to each sampled position
   on the GPU (all Tx × all waypoints batched into one `PathSolver` dispatch). The
@@ -281,7 +285,9 @@ Node, or to force a re-download on the next `setup.sh`.
 
   Either way the scene renders the union of every transmitter's rays, and a per-Tx RSS
   / LOS breakdown is shown for each waypoint. Add transmitters right in the Trajectory
-  panel; all Tx share one antenna array (matching `antennaArraySize` required).
+  panel; all Tx share one antenna array (matching `antennaArraySize` required). The
+  same Trajectory/Mobility workflow is available for activated indoor scenes; indoor
+  waypoints define the RX path, with a configurable RX height above the scene floor.
 - **A3 handover analysis** — on top of the instantaneous best-server association,
   the mobility solve runs the 3GPP A3 event model (hysteresis + time-to-trigger,
   honored in seconds via waypoint spacing and speed) over the per-Tx RSS series:
@@ -828,3 +834,83 @@ The geographic coordinates are transformed using the same local ENU anchor conve
 **Frequency integrity:** values such as `n78`, `GSM 900`, or a nominal frequency printed inside a band label are not treated as the deployed carrier centre. When no exact carrier-frequency column is supplied, select a single Frequency Band group, set its actual downlink carrier in RF Controls, and change/confirm that value before running a radio map. RadioMapSolver uses one carrier frequency for a scene; different bands/carriers must not be combined as co-channel interferers.
 
 The 3D preview draws all imported transmitter rows, with site/sector labels where practical. These markers are schematic visualisations of position and boresight, not calibrated vendor antenna radiation patterns.
+
+
+## Indoor simulation (experimental)
+
+Indoor support extends the existing simulator rather than introducing a separate
+application. It reuses the shared viewport, device controls, PathSolver, RadioMap,
+Trajectory/Mobility and Channel Analysis components, while keeping indoor and
+outdoor coordinate systems and scene lifecycles distinct. This workflow is still
+under active development; the features below describe the current implementation,
+not a claim that every indoor workflow is production-stable on every scene/runtime.
+
+### Scene import, preview and activation
+
+The staged Mitsuba XML/ZIP importer accepts scenes with referenced PLY/OBJ/STL/OFF
+meshes and textures. Imported scenes can be inspected in a canonical-coordinate
+preview before activation; selecting or previewing an imported scene does not
+replace the active outdoor Sionna scene. Explicit activation builds the indoor
+Sionna scene, applies the source-to-canonical transform to geometry, registers
+mapped ITU radio materials, and validates the loaded object/material registries.
+The indoor canonical frame is right-handed, metre-based and +Z-up. Indoor
+positions are scene-local XYZ coordinates, not outdoor ENU or WGS84 coordinates.
+
+### Indoor radio workflow
+
+- **TX/RX placement and runtime binding:** place and orient
+  devices in the existing 3D viewport. The runtime adapter converts the viewport
+  state, canonical orientations, PlanarArrays and local beam steering into Sionna
+  radio devices. Device binding happens as part of the relevant solve; the loaded
+  geometry and radio materials are not reloaded for every TX/RX change.
+- **PathSolver and all-pairs Link Matrix:** the existing Link Analysis
+  actions solve against the active indoor scene. The all-pairs view returns every
+  placed TX×RX combination from the native batched PathSolver result and uses the
+  shared link KPI and path-visualization models.
+- **RadioMapSolver:** compute an indoor coverage map on a configurable
+  plane above the scene base, using the indoor TX configuration and scene-local
+  coordinates. Indoor coverage does not use OSM geometry or a geographic anchor.
+- **Mobility and trajectory:** the existing Trajectory/Mobility
+  panel is reused for indoor scenes, including waypoint editing, loop generation,
+  playback, scrubbing, per-TX results and A3 post-processing. Indoor waypoints define
+  RX positions; the RX height control sets their height above the floor. The shared
+  movement-speed minimum is 0.1 km/h.
+- **Per-cell Channel Analysis:** the existing Coverage and
+  `ChannelAnalysisPanel` workflow can analyse selected indoor RadioMap cells. The
+  analysis uses the already-active indoor Sionna scene and the shared batched
+  PathSolver/CIR/CFR processing; it does not rebuild the outdoor scene or create a
+  second indoor-only analysis panel. Indoor candidates and results are displayed in
+  canonical scene-local XYZ, with 3D focus and clipboard actions rather than
+  WGS84/Google Maps links. The adapter validates the active scene and TX/RF snapshot
+  associated with the RadioMap. If the TX pose/power/array/pattern/polarization or
+  carrier frequency changes after the map was computed, the cached map is rejected
+  and must be recomputed before Channel Analysis. The existing viewport RX devices
+  and RX array are restored after the analysis, including when the PathSolver fails.
+
+### Indoor limitations and runtime considerations
+
+Sionna RT uses one scene-level TX array and one scene-level RX array, so devices
+participating in a multi-device solve must use compatible array dimensions and
+shared array settings. The indoor antenna preview describes the configured array
+and boresight; it is not a measured vendor radiation pattern.
+
+Indoor solver behavior and GPU performance can vary with the imported scene,
+radio materials, antenna configuration and available memory. Per-cell Channel
+Analysis is an early integration and may still have scene-specific edge cases.
+When TX/RF settings change, compute a new indoor RadioMap before requesting
+Channel Analysis.
+
+### Further reading
+
+See the [Channel Analysis guide](docs/CHANNEL_ANALYSIS_GUIDE.md) for
+interpreting channel-response results.
+
+## Indoor antenna and RF preview
+
+The shared simulator can preview the selected indoor TX/RX PlanarArray configuration in the device-local canonical frame. Array element markers use the same centered `[horizontal columns, vertical rows]` layout and default `0.5λ` spacing as the current backend `PlanarArray` factory. The preview reports wavelength, element/port counts, physical aperture, pattern, and polarization.
+
+Indoor TX beam azimuth/elevation are stored separately in `indoorBeamSteering` with `beamSteeringFrame="device_local"` and are interpreted as offsets relative to the mounted device boresight (`sceneOrientation`). The legacy outdoor `beamsteeringAzimuth`/`beamsteeringElevation` fields remain untouched and retain the `world_enu` bearing/elevation convention. The 3D arrow is only a boresight/steering direction indicator; it is not a simulated antenna gain pattern.
+
+Sionna RT defines one scene-level TX array and one scene-level RX array, so array size, pattern and polarization are shared by devices on each side within a solve. Multi-device operations therefore require compatible dimensions. The indoor pose-to-Sionna orientation conversion and TX/RX/array registration are handled by the indoor runtime. Link Analysis runs PathSolver on the active indoor scene; this preview itself displays the configured RF geometry and does not execute a radio simulation.
+
+For channel-response concepts and outputs, see the [Channel Analysis guide](docs/CHANNEL_ANALYSIS_GUIDE.md).

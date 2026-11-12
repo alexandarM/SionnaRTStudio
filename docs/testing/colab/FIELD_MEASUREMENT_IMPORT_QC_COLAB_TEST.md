@@ -8,7 +8,7 @@ Validate CSV import, source-row preservation, quality flags, filtering, export, 
 
 ## 1. Deploy and start
 
-1. Start the project using `SionnaRTStudio_Colab_Launcher.ipynb`.
+1. Start the project using `SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb`.
 2. Confirm `GET /api/health` returns `ok: true`.
 3. Open **Field Validation**.
 

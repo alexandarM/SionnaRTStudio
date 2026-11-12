@@ -33,9 +33,359 @@ const SOLVE_TIMEOUT_MS = 10 * 60_000;
 const HEALTH_TIMEOUT_MS = 5_000;
 const POLL_TIMEOUT_MS = 60_000;
 
+
+export interface SceneCoordinateProfile {
+  upAxis: '+X' | '-X' | '+Y' | '-Y' | '+Z' | '-Z';
+  forwardAxis: '+X' | '-X' | '+Y' | '-Y' | '+Z' | '-Z';
+  units: 'm' | 'cm' | 'mm' | 'ft' | 'in' | 'custom';
+  handedness: 'right' | 'left';
+  customScaleToMeters?: number | null;
+  origin: [number, number, number];
+}
+
+export interface ImportedSceneMaterial {
+  id: string;
+  name: string;
+  bsdfType: string;
+  nameHint: string | null;
+  shapeCount: number;
+  isReferenced: boolean;
+  previewColorLinear?: [number, number, number];
+  previewMetallic?: number;
+  previewRoughness?: number;
+  previewSource?: string;
+  previewTexturePath?: string | null;
+  previewTextureApplied?: boolean;
+  previewWarnings?: string[];
+}
+
+export interface ImportedSceneObject {
+  id: string;
+  name: string;
+  shapeType: string;
+  fileName: string | null;
+  resolvedFile?: string;
+  materialId: string | null;
+  previewStatus: string;
+  vertexCount: number | null;
+  faceCount: number | null;
+  canonicalBounds?: { minimum: number[]; maximum: number[] };
+}
+
+export interface SceneImportPreview {
+  sessionId: string;
+  archiveName: string;
+  xmlPath: string;
+  sceneVersion: string | null;
+  status: 'preview_ready' | 'inventory_ready';
+  activation: 'not_loaded_into_sionna' | 'active';
+  activationDetails?: IndoorSceneRuntimeStatus['summary'];
+  coordinateFrame: SceneCoordinateProfile;
+  canonicalFrame: { upAxis: string; forwardAxis: string; units: string; handedness: string };
+  coordinateTransform: { matrix: number[][]; scaleToMeters: number; determinant: number; requiresWindingFlip: boolean };
+  stats: {
+    shapeCount: number; previewedShapeCount: number; unsupportedShapeCount: number;
+    materialCount: number; referencedMaterialCount: number; resourceCount: number;
+    textureCount: number; totalVertices: number; totalFaces: number;
+  };
+  canonicalBounds: { minimum: number[]; maximum: number[] } | null;
+  materials: ImportedSceneMaterial[];
+  objects: ImportedSceneObject[];
+  resources: string[];
+  unsupportedShapeTypes: Record<string, number>;
+  warnings: string[];
+  previewUrl: string | null;
+  archiveSha256?: string;
+  cacheHit?: boolean;
+  sceneManager?: {
+    state: 'staged' | 'selected';
+    selected: boolean;
+    createdAt: string;
+    lastAccessedAt: string;
+    cacheKey: string;
+    cacheHitCount?: number;
+  };
+}
+
+export interface SceneImportSessionSummary {
+  sessionId: string;
+  archiveName: string;
+  xmlPath: string;
+  sceneVersion: string | null;
+  status: 'preview_ready' | 'inventory_ready';
+  activation: 'not_loaded_into_sionna';
+  selected: boolean;
+  state: 'staged' | 'selected';
+  createdAt: string;
+  lastAccessedAt: string;
+  storedBytes: number;
+  cacheHitCount: number;
+  archiveSha256: string;
+  coordinateFrame: SceneCoordinateProfile;
+  stats: SceneImportPreview['stats'];
+}
+
+export interface SceneImportSessionList {
+  sessions: SceneImportSessionSummary[];
+  selectedSessionId: string | null;
+  cache: {
+    sessionCount: number;
+    storedBytes: number;
+    maxSessions: number;
+    maxStoredBytes: number;
+    ttlHours: number;
+    cacheHits: number;
+  };
+}
+
+export interface SionnaItuMaterial {
+  name: string;
+  frequencyRangesGhz: Array<{ minimum: number; maximum: number }>;
+}
+
+export interface SionnaMaterialCatalog {
+  runtime: string;
+  version: string;
+  mitsubaVariant: string;
+  materials: SionnaItuMaterial[];
+}
+
+export interface IndoorSceneRuntimeSummary {
+  shapeCount: number;
+  materialCount: number;
+  vertexCount: number;
+  faceCount: number;
+  materialMappings: Record<string, string>;
+  canonicalBounds: { minimum: number[]; maximum: number[] };
+  coordinateFrame: { upAxis: string; forwardAxis: string; units: string; handedness: string };
+  activation: 'active';
+  carrierFrequencyGhz: number;
+  sionnaVersion: string;
+  mitsubaVariant: string;
+  registeredObjectCount: number;
+  registeredRadioMaterialCount: number;
+  activatedAt: string;
+}
+
+export interface IndoorSceneRuntimeStatus {
+  active: boolean;
+  sessionId: string | null;
+  summary: IndoorSceneRuntimeSummary | null;
+  deviceSync?: IndoorSceneDeviceSyncResult | null;
+}
+
+
+export interface IndoorSceneDeviceSyncResult {
+  status: 'synchronized';
+  sessionId: string;
+  carrierFrequencyGhz: number;
+  wavelengthMeters: number;
+  arraySpacingMeters: number;
+  txArray: { numCols: number; numRows: number; pattern: string; polarization: string; spacingLambda: number };
+  rxArray: { numCols: number; numRows: number; pattern: string; polarization: string; spacingLambda: number };
+  transmitterCount: number;
+  receiverCount: number;
+  transmitters: Array<{
+    id: string; name: string; runtimeName: string; position: number[];
+    orientationEulerRad: number[]; antennaArraySize: number[]; powerDbm: number;
+    steeringAzimuthDeg: number; steeringElevationDeg: number;
+  }>;
+  receivers: Array<{
+    id: string; name: string; runtimeName: string; position: number[];
+    orientationEulerRad: number[]; antennaArraySize: number[];
+  }>;
+}
+
+export interface IndoorSceneDeviceSyncResponse {
+  active: boolean;
+  sessionId: string;
+  summary: IndoorSceneRuntimeSummary & { deviceSync?: IndoorSceneDeviceSyncResult };
+  deviceSync: IndoorSceneDeviceSyncResult;
+}
+
+export async function getIndoorSceneMaterialCatalog(): Promise<SionnaMaterialCatalog> {
+  const response = await fetch('/api/scene/import/runtime/material-catalog');
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return response.json() as Promise<SionnaMaterialCatalog>;
+}
+
+export async function getIndoorSceneRuntimeStatus(): Promise<IndoorSceneRuntimeStatus> {
+  const response = await fetch('/api/scene/import/runtime/status');
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return response.json() as Promise<IndoorSceneRuntimeStatus>;
+}
+
+export async function activateImportedScene(
+  sessionId: string,
+  request: { carrierFrequencyGhz: number; materialMappings: Record<string, string> },
+): Promise<IndoorSceneRuntimeStatus> {
+  return postJson(`/api/scene/import/${encodeURIComponent(sessionId)}/activate`, request);
+}
+
+
+export async function syncIndoorSceneDevices(
+  sessionId: string,
+  request: {
+    txs: Transmitter[];
+    rxs: Receiver[];
+    carrierFrequencyGhz: number;
+    options: SolverOptions;
+  },
+): Promise<IndoorSceneDeviceSyncResponse> {
+  return postJson(`/api/scene/import/${encodeURIComponent(sessionId)}/devices/sync`, request);
+}
+
+export async function previewImportedScene(
+  file: File,
+  frame: SceneCoordinateProfile,
+): Promise<SceneImportPreview> {
+  const params = new URLSearchParams({
+    filename: file.name,
+    up_axis: frame.upAxis,
+    forward_axis: frame.forwardAxis,
+    units: frame.units,
+    handedness: frame.handedness,
+    origin_x: String(frame.origin[0]),
+    origin_y: String(frame.origin[1]),
+    origin_z: String(frame.origin[2]),
+  });
+  if (frame.units === 'custom' && frame.customScaleToMeters != null) {
+    params.set('custom_scale_to_meters', String(frame.customScaleToMeters));
+  }
+  return withRequestTimeout(180_000, async (signal) => {
+    const response = await fetch(`/api/scene/import/preview?${params.toString()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/zip' },
+      body: file,
+      signal,
+    });
+    if (!response.ok) throw new Error(await errorDetail(response));
+    return response.json() as Promise<SceneImportPreview>;
+  });
+}
+
+export async function listImportedSceneSessions(): Promise<SceneImportSessionList> {
+  const response = await fetch('/api/scene/import/sessions');
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return response.json() as Promise<SceneImportSessionList>;
+}
+
+export async function getImportedScene(sessionId: string): Promise<SceneImportPreview> {
+  const response = await fetch(`/api/scene/import/${encodeURIComponent(sessionId)}`);
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return response.json() as Promise<SceneImportPreview>;
+}
+
+export async function selectImportedScene(sessionId: string): Promise<SceneImportPreview> {
+  const response = await fetch(`/api/scene/import/${encodeURIComponent(sessionId)}/select`, { method: 'POST' });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return response.json() as Promise<SceneImportPreview>;
+}
+
+export async function clearSelectedImportedScene(): Promise<void> {
+  const response = await fetch('/api/scene/import/selection', { method: 'DELETE' });
+  if (!response.ok) throw new Error(await errorDetail(response));
+}
+
+export async function deleteImportedScene(sessionId: string): Promise<void> {
+  const response = await fetch(`/api/scene/import/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+  if (!response.ok) throw new Error(await errorDetail(response));
+}
+
 export interface SolveResponse {
   paths: PropagationPath[];
   metrics: ChannelMetrics;
+}
+
+export interface IndoorPathSolveResponse extends SolveResponse {
+  execution: {
+    status: 'completed' | 'completed_no_paths';
+    solver: 'Sionna RT PathSolver';
+    sionnaVersion: string;
+    mitsubaVariant: string;
+    carrierFrequencyGhz: number;
+    maxDepth: number;
+    samplesPerSource: number;
+    seed: number;
+    txId: string;
+    txName: string;
+    rxId: string;
+    rxName: string;
+    validPathCount: number;
+    maxDopplerHz: number;
+    solveTimeMs: number;
+    sceneSessionId: string;
+  };
+}
+
+/** Runtime/type guard for indoor solve payloads returned by the dedicated endpoint. */
+export function isIndoorPathSolveResponse(value: SolveResponse | IndoorPathSolveResponse): value is IndoorPathSolveResponse {
+  const execution = (value as Partial<IndoorPathSolveResponse>).execution;
+  return Boolean(
+    execution &&
+    (execution.status === 'completed' || execution.status === 'completed_no_paths') &&
+    typeof execution.solveTimeMs === 'number' &&
+    typeof execution.validPathCount === 'number' &&
+    typeof execution.mitsubaVariant === 'string'
+  );
+}
+
+/** Execute Sionna PathSolver; the backend applies the current placed devices automatically. */
+export async function solveIndoorPath(
+  sessionId: string,
+  request: {
+    txId: string;
+    rxId: string;
+    txs: Transmitter[];
+    rxs: Receiver[];
+    carrierFrequencyGhz: number;
+    maxDepth: number;
+    options: SolverOptions;
+  },
+): Promise<IndoorPathSolveResponse> {
+  return postJson(`/api/scene/import/${encodeURIComponent(sessionId)}/path-solve`, request);
+}
+
+export interface IndoorPathMatrixSolveResponse {
+  pairs: Array<{
+    txId: string;
+    rxId: string;
+    paths: PropagationPath[];
+    metrics: ChannelMetrics;
+    execution: IndoorPathSolveResponse['execution'];
+  }>;
+  execution: {
+    status: 'completed' | 'completed_no_paths';
+    solver: 'Sionna RT PathSolver';
+    sionnaVersion: string;
+    mitsubaVariant: string;
+    carrierFrequencyGhz: number;
+    maxDepth: number;
+    samplesPerSource: number;
+    seed: number;
+    txCount: number;
+    rxCount: number;
+    totalPairs: number;
+    pairsWithPaths: number;
+    pairsWithoutPaths: number;
+    solveTimeMs: number;
+    sceneSessionId: string;
+    nativeTensorShapes: Record<string, number[]>;
+  };
+}
+
+/** Solve all placed indoor TX×RX pairs in one native Sionna PathSolver call. */
+export async function solveIndoorPathMatrix(
+  sessionId: string,
+  request: {
+    txs: Transmitter[];
+    rxs: Receiver[];
+    carrierFrequencyGhz: number;
+    maxDepth: number;
+    options: SolverOptions;
+  },
+): Promise<IndoorPathMatrixSolveResponse> {
+  return postJson(`/api/scene/import/${encodeURIComponent(sessionId)}/path-solve-matrix`, request);
 }
 
 // One transmitter's link to the Rx at a single waypoint (multi-Tx mobility).
@@ -114,6 +464,25 @@ export interface MobilityResponse {
   steps: MobilityStep[];
   execution: MobilityExecution;
   handover?: HandoverAnalysis | null; // present when ≥ 2 Tx were solved
+}
+
+/** Run the shared multi-TX mobility pipeline in an activated indoor scene. */
+export async function solveIndoorMobility(
+  sessionId: string,
+  request: {
+    txs: Transmitter[];
+    rx: Receiver;
+    waypoints: { x: number; y: number; z: number }[];
+    freqGhz: number;
+    speedKmh: number;
+    maxDepth: number;
+    options: SolverOptions;
+    combineMode: MobilityCombineMode;
+    executionMode?: 'auto' | 'batched' | 'serial_reference';
+    handover: HandoverConfig;
+  },
+): Promise<MobilityResponse> {
+  return postJson(`/api/scene/import/${encodeURIComponent(sessionId)}/mobility`, request);
 }
 
 // Turn a failed Response into a readable message. FastAPI's `detail` is a string
@@ -237,6 +606,31 @@ export function solveRadioMap(
   });
 }
 
+/** Run the shared Sionna RadioMapSolver on the already-active indoor scene.
+ * Device poses and grid coordinates are canonical scene-local metres (+Z up).
+ * Unlike outdoor /api/radiomap, this request does not rebuild OSM geometry.
+ */
+export function solveIndoorRadioMap(
+  sessionId: string,
+  txs: Transmitter[],
+  freqGhz: number,
+  gridSize: number,
+  gridHeight: number,
+  maxDepth: number,
+  options: SolverOptions = DEFAULT_SOLVER_OPTIONS,
+  coverage: CoverageOptions = {},
+): Promise<RadioMapGrid> {
+  return postJson<RadioMapGrid>(`/api/scene/import/${encodeURIComponent(sessionId)}/radiomap`, {
+    txs,
+    freqGhz,
+    gridSize,
+    gridHeight,
+    maxDepth,
+    options,
+    ...coverage,
+  });
+}
+
 // Detailed map analytics are computed from the bounded backend cache; these
 // requests do not invoke RadioMapSolver or repeat ray tracing.
 async function getJson<T>(url: string): Promise<T> {
@@ -339,6 +733,7 @@ export interface ChannelAnalysisLink {
 
 export interface RadioMapChannelAnalysisResponse {
   mapId: string;
+  coordinateFrame: 'ENU' | 'canonical_scene_local';
   frequencyGhz: number;
   maxDepth: number;
   numSubcarriers: number;
@@ -358,7 +753,8 @@ export interface RadioMapChannelAnalysisResponse {
   };
   locations: Array<{
     cellIndex: number;
-    positionEnuM: { x: number; y: number; z: number };
+    positionEnuM?: { x: number; y: number; z: number };
+    positionSceneLocalM?: { x: number; y: number; z: number };
     radioMap: {
       servingTxIndex: number | null;
       servingTxName: string | null;

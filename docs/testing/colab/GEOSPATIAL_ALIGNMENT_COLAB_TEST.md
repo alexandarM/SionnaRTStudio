@@ -8,7 +8,7 @@ Verify that imported WGS84 positions are transformed consistently into the activ
 
 ## Before testing
 
-1. Start the application with `SionnaRTStudio_Colab_Launcher.ipynb`.
+1. Start the application with `SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb`.
 2. Confirm `/api/health` reports `ok: true`.
 3. Load the OSM scene that corresponds to the test dataset. Do not use a demo anchor for a different scene.
 4. Open **Field Validation** and import a GPS-joined test CSV.

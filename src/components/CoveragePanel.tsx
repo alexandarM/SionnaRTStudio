@@ -17,6 +17,9 @@ import { enuToLatLon } from '../utils';
 import { CellAssociationMap, AssociationLayer } from './CellAssociationMap';
 
 interface CoveragePanelProps {
+  /** Indoor maps use canonical scene-local coordinates rather than geodetic ENU. */
+  indoorMode?: boolean;
+  indoorMaxHeight?: number;
   txCount: number;
   rx: Receiver;
   bandOptions: string[];
@@ -61,6 +64,8 @@ interface CoveragePanelProps {
 
 // RADIO COVERAGE VIEWPORT — Sionna RadioMapSolver controls, display, KPIs.
 export function CoveragePanel({
+  indoorMode = false,
+  indoorMaxHeight = 3,
   txCount,
   rx,
   bandOptions,
@@ -162,36 +167,33 @@ export function CoveragePanel({
         radioMap.mapId, selectedSector, criterion, 200, candidateScope, selectionMode,
       );
       const mapAnchor = radioMap.geoReference?.anchor ?? anchor;
-      const headings = [
-        'cell_index', 'tx_index', 'tx_name', 'criterion', 'association_scope', 'selection_mode',
-        'x_enu_m', 'y_enu_m', 'z_enu_m', 'latitude_wgs84', 'longitude_wgs84', 'google_maps_url',
-        'rss_dbm', 'sinr_db', 'snr_db', 'interference_dbm',
-      ];
+      const headings = indoorMode
+        ? ['cell_index', 'tx_index', 'tx_name', 'criterion', 'association_scope', 'selection_mode', 'x_scene_local_m', 'y_scene_local_m', 'z_scene_local_m', 'rss_dbm', 'sinr_db', 'snr_db', 'interference_dbm']
+        : ['cell_index', 'tx_index', 'tx_name', 'criterion', 'association_scope', 'selection_mode', 'x_enu_m', 'y_enu_m', 'z_enu_m', 'latitude_wgs84', 'longitude_wgs84', 'google_maps_url', 'rss_dbm', 'sinr_db', 'snr_db', 'interference_dbm'];
       const escapeCsv = (value: string | number | null | undefined) => {
         const text = value == null ? '' : String(value);
         return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
       };
+      const txName = radioMap.txStats?.find((item) => item.txIndex === selectedSector)?.txName ?? `TX ${selectedSector + 1}`;
       const values = rows.map((row) => {
+        const base = [row.cellIndex, selectedSector, txName, criterion, candidateScope, selectionMode];
+        if (indoorMode) {
+          return [...base, row.x, row.y, row.z, row.rssDbm, row.sinrDb, row.snrDb, row.interferenceDbm].map(escapeCsv).join(',');
+        }
         const geo = enuToLatLon({ x: row.x, y: row.y, z: row.z }, mapAnchor);
         const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${geo.lat.toFixed(7)},${geo.lon.toFixed(7)}`;
-        const txName = radioMap.txStats?.find((item) => item.txIndex === selectedSector)?.txName ?? `TX ${selectedSector + 1}`;
-        return [
-          row.cellIndex, selectedSector, txName, criterion, candidateScope, selectionMode,
-          row.x, row.y, row.z, geo.lat.toFixed(7), geo.lon.toFixed(7), mapsUrl,
-          row.rssDbm, row.sinrDb, row.snrDb, row.interferenceDbm,
-        ].map(escapeCsv).join(',');
+        return [...base, row.x, row.y, row.z, geo.lat.toFixed(7), geo.lon.toFixed(7), mapsUrl, row.rssDbm, row.sinrDb, row.snrDb, row.interferenceDbm].map(escapeCsv).join(',');
       });
-      const csv = [
-        `# Coordinate reference: WGS84 geographic (EPSG:4326); scene ENU anchor: ${mapAnchor.latitude}, ${mapAnchor.longitude}`,
-        '# Geolocation is a local WGS84 tangent-plane conversion; correctness depends on the scene anchor being georeferenced correctly.',
-        headings.join(','),
-        ...values,
-      ].join('\n');
+      const csv = indoorMode
+        ? ['# Coordinate reference: canonical indoor scene-local metres (right-handed, +Z up). These are not geographic coordinates.', headings.join(','), ...values].join('\n')
+        : [`# Coordinate reference: WGS84 geographic (EPSG:4326); scene ENU anchor: ${mapAnchor.latitude}, ${mapAnchor.longitude}`, '# Geolocation is a local WGS84 tangent-plane conversion; correctness depends on the scene anchor being georeferenced correctly.', headings.join(','), ...values].join('\n');
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const downloadLink = document.createElement('a');
       downloadLink.href = url;
-      downloadLink.download = `radiomap_tx${selectedSector}_${criterion}_${candidateScope}_${selectionMode}_geolocated.csv`;
+      downloadLink.download = indoorMode
+        ? `radiomap_tx${selectedSector}_${criterion}_${candidateScope}_${selectionMode}_scene_local.csv`
+        : `radiomap_tx${selectedSector}_${criterion}_${candidateScope}_${selectionMode}_geolocated.csv`;
       document.body.appendChild(downloadLink);
       downloadLink.click();
       downloadLink.remove();
@@ -233,17 +235,20 @@ export function CoveragePanel({
   const sectorDistribution = sectorReport?.summaries[sectorDistributionMetric];
   const focusedCell = focusedRadioMapCellIndex == null ? null : radioMap?.cells[focusedRadioMapCellIndex] ?? null;
   const mapGeoAnchor = radioMap?.geoReference?.anchor ?? anchor;
-  const focusedCellGeo = focusedCell
+  const focusedCellGeo = focusedCell && !indoorMode
     ? enuToLatLon({ x: focusedCell.x, y: focusedCell.y, z: focusedCell.z }, mapGeoAnchor)
     : null;
   const openFocusedCellInMaps = () => {
-    if (!focusedCellGeo) return;
+    if (!focusedCellGeo || indoorMode) return;
     const url = `https://www.google.com/maps/search/?api=1&query=${focusedCellGeo.lat.toFixed(7)},${focusedCellGeo.lon.toFixed(7)}`;
     window.open(url, '_blank', 'noopener,noreferrer');
   };
   const copyFocusedCellCoordinates = async () => {
-    if (!focusedCellGeo) return;
-    const value = `${focusedCellGeo.lat.toFixed(7)}, ${focusedCellGeo.lon.toFixed(7)}`;
+    if (!focusedCell) return;
+    const value = indoorMode
+      ? `x=${focusedCell.x.toFixed(3)} m, y=${focusedCell.y.toFixed(3)} m, z=${focusedCell.z.toFixed(3)} m (scene-local)`
+      : focusedCellGeo ? `${focusedCellGeo.lat.toFixed(7)}, ${focusedCellGeo.lon.toFixed(7)}` : '';
+    if (!value) return;
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(value);
@@ -270,34 +275,32 @@ export function CoveragePanel({
       const text = value == null ? '' : String(value);
       return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
     };
-    const headers = [
-      'cell_index', 'x_enu_m', 'y_enu_m', 'z_enu_m', 'latitude_wgs84', 'longitude_wgs84', 'google_maps_url',
-      'rss_dbm', 'serving_sinr_db', 'best_sinr_db', 'path_gain_db', 'interference_dbm', 'sir_db', 'inr_db',
-      'rss_serving_tx_index', 'rss_serving_tx_name', 'best_sinr_tx_index', 'best_sinr_tx_name',
-      'best_path_gain_tx_index', 'best_path_gain_tx_name', 'dominant_interferer_tx_index', 'dominant_interferer_tx_name',
-    ];
+    const headers = indoorMode
+      ? ['cell_index', 'x_scene_local_m', 'y_scene_local_m', 'z_scene_local_m', 'rss_dbm', 'serving_sinr_db', 'best_sinr_db', 'path_gain_db', 'interference_dbm', 'sir_db', 'inr_db', 'rss_serving_tx_index', 'rss_serving_tx_name', 'best_sinr_tx_index', 'best_sinr_tx_name', 'best_path_gain_tx_index', 'best_path_gain_tx_name', 'dominant_interferer_tx_index', 'dominant_interferer_tx_name']
+      : ['cell_index', 'x_enu_m', 'y_enu_m', 'z_enu_m', 'latitude_wgs84', 'longitude_wgs84', 'google_maps_url', 'rss_dbm', 'serving_sinr_db', 'best_sinr_db', 'path_gain_db', 'interference_dbm', 'sir_db', 'inr_db', 'rss_serving_tx_index', 'rss_serving_tx_name', 'best_sinr_tx_index', 'best_sinr_tx_name', 'best_path_gain_tx_index', 'best_path_gain_tx_name', 'dominant_interferer_tx_index', 'dominant_interferer_tx_name'];
     const txName = (index: number | null | undefined) => index == null
       ? '' : radioMap.txStats?.find((item) => item.txIndex === index)?.txName ?? `TX ${index + 1}`;
     const rows = radioMap.cells.map((cell, index) => {
-      const geo = enuToLatLon({ x: cell.x, y: cell.y, z: cell.z }, mapAnchor);
-      const mapUrl = `https://www.google.com/maps/search/?api=1&query=${geo.lat.toFixed(7)},${geo.lon.toFixed(7)}`;
-      return [
-        index, cell.x, cell.y, cell.z, geo.lat.toFixed(7), geo.lon.toFixed(7), mapUrl,
-        cell.powerDbm, cell.sinr, cell.bestSinrDb, cell.pathGainDb, cell.interferencePowerDbm,
-        cell.sirDb, cell.inrDb,
+      const associationValues = [
         cell.servingTx, txName(cell.servingTx), cell.bestSinrTx, txName(cell.bestSinrTx),
         cell.bestPathGainTx, txName(cell.bestPathGainTx), cell.topInterfererTx, txName(cell.topInterfererTx),
-      ].map(csvValue).join(',');
+      ];
+      if (indoorMode) {
+        return [index, cell.x, cell.y, cell.z, cell.powerDbm, cell.sinr, cell.bestSinrDb, cell.pathGainDb, cell.interferencePowerDbm, cell.sirDb, cell.inrDb, ...associationValues].map(csvValue).join(',');
+      }
+      const geo = enuToLatLon({ x: cell.x, y: cell.y, z: cell.z }, mapAnchor);
+      const mapUrl = `https://www.google.com/maps/search/?api=1&query=${geo.lat.toFixed(7)},${geo.lon.toFixed(7)}`;
+      return [index, cell.x, cell.y, cell.z, geo.lat.toFixed(7), geo.lon.toFixed(7), mapUrl, cell.powerDbm, cell.sinr, cell.bestSinrDb, cell.pathGainDb, cell.interferencePowerDbm, cell.sirDb, cell.inrDb, ...associationValues].map(csvValue).join(',');
     });
-    const csv = [
-      `# Coordinate reference: WGS84 geographic (EPSG:4326); scene ENU anchor: ${mapAnchor.latitude}, ${mapAnchor.longitude}`,
-      '# Positions are local ENU-to-WGS84 tangent-plane conversions. Verify the scene anchor before interpreting ground truth.',
-      headers.join(','), ...rows,
-    ].join('\n');
+    const csv = indoorMode
+      ? ['# Coordinate reference: canonical indoor scene-local metres (right-handed, +Z up). No WGS84 georeference is implied.', headers.join(','), ...rows].join('\n')
+      : [`# Coordinate reference: WGS84 geographic (EPSG:4326); scene ENU anchor: ${mapAnchor.latitude}, ${mapAnchor.longitude}`, '# Positions are local ENU-to-WGS84 tangent-plane conversions. Verify the scene anchor before interpreting ground truth.', headers.join(','), ...rows].join('\n');
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
     const downloadLink = document.createElement('a');
     downloadLink.href = url;
-    downloadLink.download = `radiomap_${radioMap.mapId ?? 'current'}_geolocated_cells.csv`;
+    downloadLink.download = indoorMode
+      ? `radiomap_${radioMap.mapId ?? 'current'}_scene_local_cells.csv`
+      : `radiomap_${radioMap.mapId ?? 'current'}_geolocated_cells.csv`;
     document.body.appendChild(downloadLink);
     downloadLink.click();
     downloadLink.remove();
@@ -324,7 +327,7 @@ export function CoveragePanel({
           <h3 className="panel-title">Coverage Solver</h3>
         </div>
         <span className="text-[11px] px-2 py-0.5 rounded font-bold border bg-[#ebe7dc] border-[#e3e0d6] text-slate-600">
-          {txCount > 1 ? `Best-server · ${txCount} Tx` : 'Single Tx'}
+          {txCount === 0 ? (indoorMode ? 'No indoor TX' : 'No Tx') : txCount > 1 ? `Best-server · ${txCount} Tx` : 'Single Tx'}
         </span>
       </div>
 
@@ -345,12 +348,12 @@ export function CoveragePanel({
 
       <div className="grid grid-cols-2 gap-3.5">
         <div className="flex flex-col gap-1">
-          <label className="text-[12px] text-slate-600 font-bold">Grid Height Offset: {coverageHeight}m</label>
+          <label className="text-[12px] text-slate-600 font-bold">{indoorMode ? 'Map Plane Height Above Scene Base' : 'Grid Height Offset'}: {coverageHeight.toFixed(2)}m</label>
           <input
             type="range"
-            min="0.5"
-            max="10"
-            step="0.5"
+            min={indoorMode ? 0.1 : 0.5}
+            max={indoorMode ? Math.max(0.1, indoorMaxHeight) : 10}
+            step={indoorMode ? 0.05 : 0.5}
             className="accent-[#cc785c] cursor-ew-resize"
             value={coverageHeight}
             onChange={(e) => setCoverageHeight(parseFloat(e.target.value))}
@@ -358,18 +361,22 @@ export function CoveragePanel({
         </div>
 
         <div className="flex flex-col gap-1">
-          <label className="text-[12px] text-slate-600 font-bold">Grid Step: {coverageRes}m</label>
+          <label className="text-[12px] text-slate-600 font-bold">{indoorMode ? 'Grid Cell Size' : 'Grid Step'}: {coverageRes.toFixed(2)}m</label>
           <input
             type="range"
-            min="3"
-            max="12"
-            step="1"
+            min={indoorMode ? 0.1 : 3}
+            max={indoorMode ? 2 : 12}
+            step={indoorMode ? 0.1 : 1}
             className="accent-[#cc785c] cursor-ew-resize"
             value={coverageRes}
-            onChange={(e) => setCoverageRes(parseInt(e.target.value, 10))}
+            onChange={(e) => setCoverageRes(parseFloat(e.target.value))}
           />
         </div>
       </div>
+
+      {indoorMode && (
+        <p className="text-[10px] leading-relaxed text-slate-500">Indoor map coordinates are local to the activated scene. The map plane is placed at the selected height above the scene's minimum Z; no geographic anchor or outdoor building footprint is used.</p>
+      )}
 
       {/* Metric — interference-aware SINR vs. received power */}
       <div className="flex flex-col gap-1">
@@ -468,11 +475,11 @@ export function CoveragePanel({
       <button
         id="btn-compute-radio-map"
         onClick={() => onRunHeatmap(coverageRes, coverageHeight, samplesPerTx, radioMapSeed)}
-        disabled={heatmapLoading || !backendOnline || (bandOptions.length > 1 && selectedBand === '__all__')}
+        disabled={heatmapLoading || !backendOnline || (indoorMode && txCount === 0) || (bandOptions.length > 1 && selectedBand === '__all__')}
         className="w-full btn-signal text-[14px] font-bold py-2.5 px-3 rounded uppercase tracking-widest flex items-center justify-center gap-1.5 transition shadow-sm cursor-pointer border-none"
       >
         <Activity className={`w-4 h-4 text-white ${heatmapLoading ? 'animate-spin' : ''}`} />
-        {heatmapLoading ? 'Computing Propagation Matrix...' : !backendOnline ? 'Backend offline' : (bandOptions.length > 1 && selectedBand === '__all__') ? 'Select one frequency band' : 'Map Coverage Matrix Grid'}
+        {heatmapLoading ? 'Computing Propagation Matrix...' : !backendOnline ? 'Backend offline' : indoorMode && txCount === 0 ? 'Place an indoor TX first' : (bandOptions.length > 1 && selectedBand === '__all__') ? 'Select one frequency band' : 'Map Coverage Matrix Grid'}
       </button>
       {solveError && (
         <div className="text-[12px] text-red-400 bg-red-500/10 border border-red-500/30 rounded px-2.5 py-1.5 font-mono">
@@ -761,7 +768,7 @@ export function CoveragePanel({
             <span className="rounded border border-[#e3e0d6] bg-white px-2 py-1 text-[10px] font-mono text-slate-500">{radioMap.cells.length.toLocaleString()} cells</span>
           </div>
           <div className="flex justify-end">
-            <button type="button" onClick={exportGeolocatedRadioMap} className="inline-flex items-center gap-1.5 rounded border border-[#cfc8b9] bg-white px-3 py-1.5 text-[10px] font-bold text-slate-700 hover:border-[#cc785c]"><Download className="h-3 w-3" /> Export full geolocated map CSV</button>
+            <button type="button" onClick={exportGeolocatedRadioMap} className="inline-flex items-center gap-1.5 rounded border border-[#cfc8b9] bg-white px-3 py-1.5 text-[10px] font-bold text-slate-700 hover:border-[#cc785c]"><Download className="h-3 w-3" /> {indoorMode ? 'Export scene-local map CSV' : 'Export full geolocated map CSV'}</button>
           </div>
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
             <label className="flex flex-col gap-1 text-[9px] font-semibold text-slate-600">
@@ -792,29 +799,37 @@ export function CoveragePanel({
           <CellAssociationMap
             radioMap={radioMap}
             txs={txs}
+            indoorMode={indoorMode}
             layer={associationLayer}
             selectedCellIndex={focusedRadioMapCellIndex}
             onSelectCell={onFocusCell}
           />
-          {focusedCell && focusedCellGeo && (
+          {focusedCell && (
             <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-amber-200 bg-amber-50 p-2">
               <div className="min-w-0">
                 <div className="text-[10px] font-bold text-amber-900">Selected map cell #{focusedRadioMapCellIndex}</div>
-                <div className="font-mono text-[9px] text-amber-900">{focusedCellGeo.lat.toFixed(7)}, {focusedCellGeo.lon.toFixed(7)}</div>
-                <div className="font-mono text-[8px] text-amber-800">ENU {focusedCell.x.toFixed(2)}, {focusedCell.y.toFixed(2)}, {focusedCell.z.toFixed(2)} m</div>
+                {indoorMode ? (
+                  <div className="font-mono text-[9px] text-amber-900">Scene-local X/Y/Z: {focusedCell.x.toFixed(3)}, {focusedCell.y.toFixed(3)}, {focusedCell.z.toFixed(3)} m</div>
+                ) : (
+                  <>
+                    {focusedCellGeo && <div className="font-mono text-[9px] text-amber-900">{focusedCellGeo.lat.toFixed(7)}, {focusedCellGeo.lon.toFixed(7)}</div>}
+                    <div className="font-mono text-[8px] text-amber-800">ENU {focusedCell.x.toFixed(2)}, {focusedCell.y.toFixed(2)}, {focusedCell.z.toFixed(2)} m</div>
+                  </>
+                )}
               </div>
               <div className="flex gap-1">
-                <button type="button" onClick={openFocusedCellInMaps} className="rounded border border-amber-300 bg-white px-2 py-1.5 text-[9px] font-semibold text-amber-900">Open Google Maps</button>
-                <button type="button" onClick={() => void copyFocusedCellCoordinates()} className="rounded border border-amber-300 bg-white px-2 py-1.5 text-[9px] font-semibold text-amber-900">Copy coordinates</button>
+                {!indoorMode && <button type="button" onClick={openFocusedCellInMaps} className="rounded border border-amber-300 bg-white px-2 py-1.5 text-[9px] font-semibold text-amber-900">Open Google Maps</button>}
+                <button type="button" onClick={() => void copyFocusedCellCoordinates()} className="rounded border border-amber-300 bg-white px-2 py-1.5 text-[9px] font-semibold text-amber-900">{indoorMode ? 'Copy scene coordinates' : 'Copy coordinates'}</button>
               </div>
             </div>
           )}
-          {radioMap.geoReference && (
+          {indoorMode ? (
+            <div className="rounded border border-sky-200 bg-sky-50 p-2 text-[9px] leading-relaxed text-sky-900">Coordinates are canonical indoor scene-local metres (right-handed, +Z up). They are deliberately not converted to latitude/longitude.</div>
+          ) : radioMap.geoReference ? (
             <div className="rounded border border-sky-200 bg-sky-50 p-2 text-[9px] leading-relaxed text-sky-900">
               <b>Georeference captured for this radio map:</b> WGS84 anchor {radioMap.geoReference.anchor.latitude.toFixed(7)}, {radioMap.geoReference.anchor.longitude.toFixed(7)} · {radioMap.geoReference.method}. Coordinates remain tied to this snapshot even if the map anchor is later moved.
             </div>
-          )}
-          {!radioMap.geoReference && (
+          ) : (
             <div className="rounded border border-amber-200 bg-amber-50 p-2 text-[9px] text-amber-900">This radio-map has no saved georeference snapshot. Coordinates will use the current scene anchor; verify it before using Google Maps.</div>
           )}
           {radioMap.associationStats && (
@@ -964,6 +979,7 @@ export function CoveragePanel({
           anchor={radioMap.geoReference?.anchor ?? anchor}
           candidateScope={candidateScope}
           selectionMode={selectionMode}
+          indoorMode={indoorMode}
           onFocusCell={onFocusCell}
         />
       )}

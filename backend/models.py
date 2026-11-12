@@ -32,6 +32,11 @@ class BuildingFootprint(BaseModel):
     points: Optional[list] = None
 
 
+class IndoorBeamSteering(BaseModel):
+    azimuthDeg: float = 0.0
+    elevationDeg: float = 0.0
+
+
 class Transmitter(BaseModel):
     id: str = "tx"
     name: str = "Tx"
@@ -43,6 +48,12 @@ class Transmitter(BaseModel):
     antennaArraySize: Tuple[int, int] = (8, 8)  # [horizontal, vertical]
     beamsteeringAzimuth: float = 0.0
     beamsteeringElevation: float = 0.0
+    # Indoor steering angles are offsets in the device-local canonical frame.
+    # Outdoor legacy requests retain world ENU azimuth/elevation semantics.
+    beamSteeringFrame: Literal["device_local", "world_enu"] = "world_enu"
+    # Stored independently so an indoor local steering edit never overwrites
+    # the transmitter's legacy outdoor compass bearing/elevation.
+    indoorBeamSteering: Optional[IndoorBeamSteering] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     # Imported inventory metadata; not silently converted into an antenna model.
@@ -56,6 +67,14 @@ class Transmitter(BaseModel):
     antennaGainDbi: Optional[float] = None
     mechanicalDowntiltDeg: Optional[float] = None
     electricalDowntiltDeg: Optional[float] = None
+    # Indoor placement is persisted in the scene-local canonical frame. These
+    # fields must survive Pydantic parsing (extra request fields are otherwise
+    # discarded before the Sionna adapter can consume them).
+    scenePosition: Optional[Tuple[float, float, float]] = None
+    sceneNormal: Optional[Tuple[float, float, float]] = None
+    sceneOrientation: Optional[Tuple[float, float, float, float]] = None
+    sceneSurface: Optional[Literal["floor", "ceiling", "wall", "other"]] = None
+    sceneSessionId: Optional[str] = None
 
 
 class Receiver(BaseModel):
@@ -66,6 +85,11 @@ class Receiver(BaseModel):
     antennaArraySize: Tuple[int, int] = (1, 1)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    scenePosition: Optional[Tuple[float, float, float]] = None
+    sceneNormal: Optional[Tuple[float, float, float]] = None
+    sceneOrientation: Optional[Tuple[float, float, float, float]] = None
+    sceneSurface: Optional[Literal["floor", "ceiling", "wall", "other"]] = None
+    sceneSessionId: Optional[str] = None
 
 
 class PropagationPath(BaseModel):
@@ -364,6 +388,33 @@ class RadioMapRequest(BaseModel):
         raise ValueError("RadioMapRequest needs `txs` or `tx`")
 
 
+class IndoorRadioMapRequest(RadioMapRequest):
+    """Run RadioMapSolver on an already activated indoor Sionna scene.
+
+    Device poses and the grid are expressed in canonical scene-local metres.
+    The request deliberately carries no outdoor building footprints/materials:
+    those are already loaded in the active Sionna scene.
+    """
+    tx: Optional[Transmitter] = None
+    txs: List[Transmitter] = Field(min_length=1, max_length=128)
+    buildings: List[BuildingFootprint] = Field(default_factory=list)
+    gridSize: float = Field(default=0.5, gt=0.05, le=10.0)
+    gridHeight: float = Field(default=1.2, gt=0.0, le=20.0)
+    samplesPerTx: int = Field(default=100_000, ge=1_000, le=10_000_000)
+
+    @model_validator(mode="after")
+    def validate_indoor_transmitters(self) -> "IndoorRadioMapRequest":
+        ids = [device.id for device in self.txs]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Indoor radio-map TX IDs must be unique.")
+        for device in self.txs:
+            if device.scenePosition is None:
+                raise ValueError(f"Indoor TX '{device.id}' has no scenePosition; place it in the viewport first.")
+            if not device.sceneSessionId:
+                raise ValueError(f"Indoor TX '{device.id}' is not associated with an imported scene session.")
+        return self
+
+
 # ── Mobility (Rx trajectory) ────────────────────────────────────────────────
 
 class TxLinkMetrics(BaseModel):
@@ -452,7 +503,7 @@ class MobilityRequest(BaseModel):
     buildings: List[BuildingFootprint]
     waypoints: List[ENUVector]
     freqGhz: float = 28.0
-    speedKmh: float = 30.0
+    speedKmh: float = Field(default=30.0, ge=0.1, le=500.0)
     maxDepth: int = 3
     options: SolverOptions = Field(default_factory=SolverOptions)
     materials: List[MaterialConfig] = Field(default_factory=list)
@@ -474,6 +525,42 @@ class MobilityRequest(BaseModel):
         if self.tx is not None:
             return [self.tx]
         raise ValueError("MobilityRequest needs `txs` or `tx`")
+
+
+class IndoorMobilityRequest(BaseModel):
+    """Trace a moving RX over scene-local waypoints in an active indoor scene."""
+    txs: List[Transmitter] = Field(min_length=1, max_length=128)
+    rx: Receiver
+    waypoints: List[ENUVector] = Field(min_length=2, max_length=100)
+    freqGhz: float = Field(default=28.0, gt=0.0, le=300.0)
+    speedKmh: float = Field(default=3.0, ge=0.1, le=500.0)
+    maxDepth: int = Field(default=3, ge=0, le=20)
+    options: SolverOptions = Field(default_factory=SolverOptions)
+    combineMode: Literal["best_server", "sum"] = "best_server"
+    executionMode: Literal["auto", "batched", "serial_reference"] = "auto"
+    handover: HandoverConfig = Field(default_factory=HandoverConfig)
+
+    @model_validator(mode="after")
+    def validate_indoor_devices(self) -> "IndoorMobilityRequest":
+        tx_ids = [device.id for device in self.txs]
+        if len(tx_ids) != len(set(tx_ids)):
+            raise ValueError("Indoor mobility TX IDs must be unique.")
+        session_ids = {device.sceneSessionId for device in self.txs}
+        if len(session_ids) != 1:
+            raise ValueError("All indoor mobility transmitters must belong to the same imported scene session.")
+        for device in self.txs:
+            if device.scenePosition is None:
+                raise ValueError(f"Indoor TX '{device.id}' has no scenePosition; place it in the viewport first.")
+            if not device.sceneSessionId:
+                raise ValueError(f"Indoor TX '{device.id}' is not associated with an imported scene session.")
+        # The RX is a mobility antenna/configuration template, not a separately
+        # placed viewport device. Its runtime pose is synthesized from the first
+        # trajectory waypoint by solve_indoor_mobility(). This keeps indoor
+        # mobility aligned with its path editor: waypoint positions ARE the RX.
+        return self
+
+    def transmitters(self) -> List[Transmitter]:
+        return self.txs
 
 
 class MobilityExecution(BaseModel):
@@ -555,6 +642,81 @@ class CIRRequest(BaseModel):
                 "CSV export supports one Tx→Rx link; "
                 "use .npz for the multi-device tensor"
             )
+
+
+class IndoorSceneActivationRequest(BaseModel):
+    """Activate a staged indoor Mitsuba scene as a Sionna RT scene."""
+    carrierFrequencyGhz: float = Field(default=28.0, gt=0.0, le=300.0)
+    # Map original Mitsuba material IDs to the installed Sionna ITU catalogue.
+    materialMappings: dict[str, str] = Field(default_factory=dict)
+
+
+class IndoorSceneDeviceSyncRequest(BaseModel):
+    """Attach placed indoor application devices to an active Sionna scene."""
+    txs: List[Transmitter] = Field(min_length=1, max_length=128)
+    rxs: List[Receiver] = Field(min_length=1, max_length=512)
+    carrierFrequencyGhz: float = Field(default=28.0, gt=0.0, le=300.0)
+    options: SolverOptions = Field(default_factory=SolverOptions)
+
+    @model_validator(mode="after")
+    def validate_indoor_placements(self) -> "IndoorSceneDeviceSyncRequest":
+        for kind, devices in (("TX", self.txs), ("RX", self.rxs)):
+            ids = [device.id for device in devices]
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"Indoor {kind} device IDs must be unique.")
+            for device in devices:
+                if device.scenePosition is None:
+                    raise ValueError(f"Indoor {kind} '{device.id}' has no scenePosition; place it in the viewport first.")
+                if not device.sceneSessionId:
+                    raise ValueError(f"Indoor {kind} '{device.id}' is not associated with an imported scene session.")
+        return self
+
+
+class IndoorPathMatrixSolveRequest(BaseModel):
+    """Run every placed indoor TX→RX combination in one PathSolver dispatch."""
+    txs: List[Transmitter] = Field(min_length=1, max_length=128)
+    rxs: List[Receiver] = Field(min_length=1, max_length=512)
+    carrierFrequencyGhz: float = Field(default=28.0, gt=0.0, le=300.0)
+    maxDepth: int = Field(default=3, ge=0, le=20)
+    options: SolverOptions = Field(default_factory=SolverOptions)
+
+    @model_validator(mode="after")
+    def validate_matrix_devices(self) -> "IndoorPathMatrixSolveRequest":
+        for kind, devices in (("TX", self.txs), ("RX", self.rxs)):
+            ids = [device.id for device in devices]
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"Indoor {kind} device IDs must be unique.")
+            for device in devices:
+                if device.scenePosition is None or not device.sceneSessionId:
+                    raise ValueError(f"Every submitted indoor {kind} must be placed in an imported scene.")
+        return self
+
+
+class IndoorPathSolveRequest(BaseModel):
+    """Run one PathSolver link; current viewport devices are bound automatically."""
+    txId: str = Field(min_length=1, max_length=160)
+    rxId: str = Field(min_length=1, max_length=160)
+    txs: List[Transmitter] = Field(min_length=1, max_length=128)
+    rxs: List[Receiver] = Field(min_length=1, max_length=512)
+    carrierFrequencyGhz: float = Field(default=28.0, gt=0.0, le=300.0)
+    maxDepth: int = Field(default=3, ge=0, le=20)
+    options: SolverOptions = Field(default_factory=SolverOptions)
+
+    @model_validator(mode="after")
+    def validate_selected_pair_and_placements(self) -> "IndoorPathSolveRequest":
+        tx_ids = [device.id for device in self.txs]
+        rx_ids = [device.id for device in self.rxs]
+        if len(tx_ids) != len(set(tx_ids)) or len(rx_ids) != len(set(rx_ids)):
+            raise ValueError("Indoor TX/RX device IDs must be unique.")
+        if self.txId not in tx_ids:
+            raise ValueError("The selected TX must be included in the current placed indoor TX set.")
+        if self.rxId not in rx_ids:
+            raise ValueError("The selected RX must be included in the current placed indoor RX set.")
+        for kind, devices in (("TX", self.txs), ("RX", self.rxs)):
+            for device in devices:
+                if device.scenePosition is None or not device.sceneSessionId:
+                    raise ValueError(f"Every submitted indoor {kind} must be placed in an imported scene.")
+        return self
 
 
 # ── Standalone Mitsuba/Sionna scene export ──────────────────────────────────

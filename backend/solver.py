@@ -98,6 +98,15 @@ def _clear_devices(scene) -> None:
             pass
 
 
+def _clear_receivers(scene) -> None:
+    """Remove receiver devices without disturbing an already-active scene's TXs."""
+    try:
+        for name in list(getattr(scene, "receivers").keys()):
+            scene.remove(name)
+    except Exception:
+        pass
+
+
 def _beam_target(tx_pos, az_deg, el_deg) -> list[float]:
     """A point ~100 m along the steered beam.
 
@@ -399,6 +408,8 @@ def _solve_at(
     max_depth: int = MAX_DEPTH,
     opts: SolverOptions | None = None,
     tx_id: str | None = None,
+    preserve_tx: bool = False,
+    rx_orientation: tuple[float, float, float] | None = None,
 ) -> tuple[list[PropagationPath], float]:
     """Run PathSolver for one Tx/Rx placement; return paths + max |Doppler| (Hz).
 
@@ -411,9 +422,15 @@ def _solve_at(
     """
     from sionna.rt import Receiver as RtReceiver
 
-    _clear_devices(scene)
-    _place_tx(scene, "tx_d", tx_pos, beam_target)
-    rx_dev = RtReceiver(name="rx_d", position=rx_pos)
+    if preserve_tx:
+        _clear_receivers(scene)
+    else:
+        _clear_devices(scene)
+        _place_tx(scene, "tx_d", tx_pos, beam_target)
+    receiver_kwargs = {"name": "rx_d", "position": rx_pos}
+    if rx_orientation is not None:
+        receiver_kwargs["orientation"] = tuple(float(v) for v in rx_orientation)
+    rx_dev = RtReceiver(**receiver_kwargs)
     if rx_velocity is not None:
         try:
             rx_dev.velocity = [float(v) for v in rx_velocity]
@@ -472,6 +489,8 @@ def _solve_batched(
     max_depth: int = MAX_DEPTH,
     opts: SolverOptions | None = None,
     return_native: bool = False,
+    preserve_tx: bool = False,
+    rx_orientation: tuple[float, float, float] | None = None,
 ) -> list[list[tuple[list[PropagationPath], float]]] | tuple[list[list[tuple[list[PropagationPath], float]]], object]:
     """Ray-trace every (waypoint, transmitter) pair in a SINGLE PathSolver dispatch.
 
@@ -490,11 +509,17 @@ def _solve_batched(
     """
     from sionna.rt import Receiver as RtReceiver
 
-    _clear_devices(scene)
-    for j, spec in enumerate(tx_specs):
-        _place_tx(scene, f"tx_b_{j}", spec.pos, spec.beam)
+    if preserve_tx:
+        _clear_receivers(scene)
+    else:
+        _clear_devices(scene)
+        for j, spec in enumerate(tx_specs):
+            _place_tx(scene, f"tx_b_{j}", spec.pos, spec.beam)
     for i, (pos, vel) in enumerate(zip(rx_positions, rx_velocities)):
-        rx_dev = RtReceiver(name=f"rx_b_{i}", position=pos)
+        receiver_kwargs = {"name": f"rx_b_{i}", "position": pos}
+        if rx_orientation is not None:
+            receiver_kwargs["orientation"] = tuple(float(v) for v in rx_orientation)
+        rx_dev = RtReceiver(**receiver_kwargs)
         try:
             rx_dev.velocity = [float(v) for v in vel]  # per-rx Doppler heading
         except Exception:
@@ -942,7 +967,14 @@ def _mobility_step(
     )
 
 
-def solve_mobility(req) -> tuple[list, dict, "HandoverAnalysis | None"]:
+def solve_mobility(
+    req,
+    *,
+    scene_override=None,
+    prepared_tx_names: list[str] | None = None,
+    preserve_scene_transmitters: bool = False,
+    receiver_orientation: tuple[float, float, float] | None = None,
+) -> tuple[list, dict, "HandoverAnalysis | None"]:
     """Best-server mobility: ray-trace EVERY transmitter to each Rx waypoint.
 
     All transmitters and all waypoints go into a single batched PathSolver
@@ -959,7 +991,11 @@ def solve_mobility(req) -> tuple[list, dict, "HandoverAnalysis | None"]:
     txs = req.transmitters()
     combine = getattr(req, "combineMode", "best_server")
     execution_mode = getattr(req, "executionMode", "auto")
-    scene = build_scene(req.buildings, req.freqGhz, getattr(req, "materials", None))
+    scene = scene_override if scene_override is not None else build_scene(
+        getattr(req, "buildings", []), req.freqGhz, getattr(req, "materials", None)
+    )
+    if preserve_scene_transmitters and scene_override is None:
+        raise ValueError("Preserving scene transmitters requires an active scene override")
 
     # One scene tx_array is shared by every transmitter (Sionna), so they must use
     # the same antenna geometry — the same rule the multi-Tx radio map enforces.
@@ -969,14 +1005,33 @@ def solve_mobility(req) -> tuple[list, dict, "HandoverAnalysis | None"]:
             "Multi-transmitter mobility requires matching antennaArraySize across transmitters"
         )
 
-    n_tx_ant = _set_tx_array(scene, txs[0].antennaArraySize, req.options)
-    _set_rx_array(scene, req.rx.antennaArraySize, req.options)
+    if preserve_scene_transmitters:
+        tx_registry = dict(getattr(scene, "transmitters", {}))
+        expected_names = list(prepared_tx_names or [])
+        if len(expected_names) != len(txs) or list(tx_registry.keys()) != expected_names:
+            raise ValueError(
+                "The active indoor Sionna TX registry does not match the prepared mobility transmitters. "
+                "Re-run the indoor mobility request so the current TX set is applied."
+            )
+        tx_array = getattr(scene, "tx_array", None)
+        rx_array = getattr(scene, "rx_array", None)
+        n_tx_ant = int(getattr(tx_array, "num_ant", 0)) if tx_array is not None else 0
+        if n_tx_ant < 1 or rx_array is None:
+            raise ValueError("The active indoor Sionna scene has no compatible TX/RX antenna arrays.")
+    else:
+        n_tx_ant = _set_tx_array(scene, txs[0].antennaArraySize, req.options)
+        _set_rx_array(scene, req.rx.antennaArraySize, req.options)
 
-    # Resolve each transmitter once (scene position, steered beam target, power).
+    # Resolve every TX in the common solver coordinate frame. For an indoor
+    # override, ENUVector is only a carrier for canonical scene-local metres.
     tx_specs: list[_TxSpec] = []
     for t in txs:
-        pos = [float(t.enu.x), float(t.enu.y), _device_z(t.enu, t.height, req.buildings, getattr(t, "heightReference", None))]
-        beam = _beam_target(pos, t.beamsteeringAzimuth, t.beamsteeringElevation)
+        if preserve_scene_transmitters:
+            pos = [float(t.enu.x), float(t.enu.y), float(t.enu.z)]
+            beam = None  # orientation/steering is already applied to the active Sionna TX object
+        else:
+            pos = [float(t.enu.x), float(t.enu.y), _device_z(t.enu, t.height, req.buildings, getattr(t, "heightReference", None))]
+            beam = _beam_target(pos, t.beamsteeringAzimuth, t.beamsteeringElevation)
         tx_specs.append(_TxSpec(pos=pos, beam=beam, power_dbm=float(t.powerDbm),
                                 id=t.id, name=t.name))
 
@@ -987,8 +1042,11 @@ def solve_mobility(req) -> tuple[list, dict, "HandoverAnalysis | None"]:
     rx_positions: list[list[float]] = []
     velocities: list[list[float]] = []
     for i, wp in enumerate(wps):
-        rx_positions.append([float(wp.x), float(wp.y),
-                             _device_z(wp, req.rx.height, req.buildings)])
+        if preserve_scene_transmitters:
+            rx_positions.append([float(wp.x), float(wp.y), float(wp.z)])
+        else:
+            rx_positions.append([float(wp.x), float(wp.y),
+                                 _device_z(wp, req.rx.height, req.buildings)])
         nxt = wps[i + 1] if i + 1 < len(wps) else wps[i - 1] if i > 0 else None
         velocity = [0.0, 0.0, 0.0]
         if nxt is not None:
@@ -1000,36 +1058,52 @@ def solve_mobility(req) -> tuple[list, dict, "HandoverAnalysis | None"]:
                 velocity = [dx / norm * speed_ms, dy / norm * speed_ms, 0.0]
         velocities.append(velocity)
 
-    # Fast path: one GPU dispatch for all (waypoint, Tx) pairs. Defensive fallback
-    # to per-(waypoint, Tx) solves if the batched extraction misbehaves.
-    per_wp: list[list[tuple[list, float]]] | None = None
-    if execution_mode != "serial_reference":
-        try:
-            per_wp = _solve_batched(scene, tx_specs, rx_positions, velocities,
-                                    n_tx_ant,
-                                    max_depth=req.maxDepth, opts=req.options)
-            if len(per_wp) != len(wps):
+    # Indoor mobility must not clear or recreate the active scene's TX objects:
+    # their canonical orientation and steering were applied by the device adapter.
+    # Preserve the viewport RX devices while temporary waypoint receivers exist.
+    saved_receivers = list(dict(getattr(scene, "receivers", {})).values()) if preserve_scene_transmitters else []
+    try:
+        # Fast path: one GPU dispatch for all (waypoint, Tx) pairs. Defensive fallback
+        # to per-(waypoint, Tx) solves if the batched extraction misbehaves.
+        per_wp: list[list[tuple[list, float]]] | None = None
+        if execution_mode != "serial_reference":
+            try:
+                per_wp = _solve_batched(
+                    scene, tx_specs, rx_positions, velocities, n_tx_ant,
+                    max_depth=req.maxDepth, opts=req.options,
+                    preserve_tx=preserve_scene_transmitters,
+                    rx_orientation=receiver_orientation,
+                )
+                if len(per_wp) != len(wps):
+                    per_wp = None
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                logger.warning("Batched mobility solve failed; falling back to per-waypoint solves: %s", exc)
                 per_wp = None
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            logger.warning("Batched mobility solve failed; falling back to per-waypoint solves: %s", exc)
-            per_wp = None
-        if execution_mode == "batched" and per_wp is None:
-            raise RuntimeError("Required batched mobility execution did not produce a valid result")
+            if execution_mode == "batched" and per_wp is None:
+                raise RuntimeError("Required batched mobility execution did not produce a valid result")
 
-    batched_result_used = per_wp is not None
-    steps: list = []
-    for i in range(len(wps)):
-        if per_wp is not None:
-            per_tx_results = per_wp[i]
-        else:
-            per_tx_results = [
-                _solve_at(scene, spec.pos, rx_positions[i], spec.power_dbm,
-                          n_tx_ant, beam_target=spec.beam,
-                          rx_velocity=velocities[i], max_depth=req.maxDepth,
-                          opts=req.options, tx_id=spec.id)
-                for spec in tx_specs
-            ]
-        steps.append(_mobility_step(i, rx_positions[i], tx_specs, per_tx_results, combine))
+        batched_result_used = per_wp is not None
+        steps: list = []
+        for i in range(len(wps)):
+            if per_wp is not None:
+                per_tx_results = per_wp[i]
+            else:
+                per_tx_results = [
+                    _solve_at(
+                        scene, spec.pos, rx_positions[i], spec.power_dbm, n_tx_ant,
+                        beam_target=spec.beam, rx_velocity=velocities[i],
+                        max_depth=req.maxDepth, opts=req.options, tx_id=spec.id,
+                        preserve_tx=preserve_scene_transmitters,
+                        rx_orientation=receiver_orientation,
+                    )
+                    for spec in tx_specs
+                ]
+            steps.append(_mobility_step(i, rx_positions[i], tx_specs, per_tx_results, combine))
+    finally:
+        if preserve_scene_transmitters:
+            _clear_receivers(scene)
+            for receiver in saved_receivers:
+                scene.add(receiver)
     pair_count = len(wps) * len(tx_specs)
     strategy = ("single_batched_dispatch" if batched_result_used else
                 "serial_reference" if execution_mode == "serial_reference" else
@@ -1209,7 +1283,14 @@ def get_radio_map_tx_data(map_id: str, tx_index: int) -> dict:
         "noisePowerW": cache["noisePowerW"],
         "metadata": cache["txMetadata"][tx_index],
         "gridSize": cache["gridSize"],
+        "sceneContext": cache.get("sceneContext") or {},
     }
+
+
+def is_indoor_radio_map(map_id: str) -> bool:
+    """Return whether a cached map uses canonical scene-local coordinates."""
+    cache = _get_cached_radio_map(map_id)
+    return (cache.get("sceneContext") or {}).get("sceneType") == "indoor"
 
 
 def _get_cached_radio_map(map_id: str) -> dict:
@@ -1383,8 +1464,20 @@ def _channel_profiles_for_pair(
     return taps, cfr
 
 
-def solve_radio_map_channel_analysis(map_id: str, req: ChannelAnalysisRequest) -> dict:
-    """Run one batched PathSolver pass at selected cached radio-map cells."""
+def solve_radio_map_channel_analysis(
+    map_id: str,
+    req: ChannelAnalysisRequest,
+    *,
+    scene_override=None,
+    preserve_scene_transmitters: bool = False,
+) -> dict:
+    """Run one batched PathSolver pass at selected cached radio-map cells.
+
+    Outdoor calls reconstruct the original scene from the cached map snapshot.
+    Indoor calls inject the already-activated Sionna scene and preserve its TX
+    registry; only temporary RX devices and the requested RX array are changed
+    for the duration of the solve.
+    """
     import time
     from sionna.rt import subcarrier_frequencies
 
@@ -1444,52 +1537,99 @@ def solve_radio_map_channel_analysis(map_id: str, req: ChannelAnalysisRequest) -
     if any(tuple(int(v) for v in txs[i].antennaArraySize) != original_size for i in tx_indices):
         raise ValueError("All selected transmitters must share the same antennaArraySize")
     options: SolverOptions = context["options"]
-    scene = build_scene(context["buildings"], float(context["frequencyGhz"]), context["materials"])
-    n_tx_ant = _set_tx_array(scene, original_size, options)
-    n_rx_ant = _set_planar_array(scene, "rx", req.rxArraySize, options.rxPattern, options.rxPolarization)
-    estimated_cfr_samples = _estimate_channel_cfr_samples(
-        pair_count, n_rx_ant, n_tx_ant, int(req.numSubcarriers),
+    scene = scene_override if scene_override is not None else build_scene(
+        context["buildings"], float(context["frequencyGhz"]), context["materials"]
     )
-    if estimated_cfr_samples > MAX_CHANNEL_ANALYSIS_CFR_COMPLEX_SAMPLES:
-        raise ValueError(
-            f"Requested Tx/Rx arrays and subcarrier grid require an estimated "
-            f"{estimated_cfr_samples:,} complex CFR values; limit is "
-            f"{MAX_CHANNEL_ANALYSIS_CFR_COMPLEX_SAMPLES:,}. Reduce selected "
-            f"locations, array size, or CFR subcarriers."
+    if preserve_scene_transmitters:
+        if scene_override is None:
+            raise ValueError("Preserving indoor transmitters requires the active scene override")
+        expected_names = list(context.get("runtimeTxNames") or [])
+        loaded_names = list(dict(getattr(scene, "transmitters", {})).keys())
+        if not expected_names or loaded_names != expected_names or len(expected_names) != len(txs):
+            raise ValueError(
+                "The active indoor Sionna TX registry no longer matches the radio-map snapshot. "
+                "Recompute the indoor radio map before running Channel Analysis."
+            )
+        tx_array = getattr(scene, "tx_array", None)
+        if tx_array is None:
+            raise ValueError("The active indoor Sionna scene has no configured TX antenna array.")
+        runtime_array = context.get("runtimeTxArray") or {}
+        if runtime_array:
+            expected_array = (int(runtime_array.get("numCols", -1)), int(runtime_array.get("numRows", -1)))
+            if expected_array != original_size:
+                raise ValueError(
+                    "The cached radio-map TX array does not match its transmitter configuration. "
+                    "Recompute the indoor radio map before running Channel Analysis."
+                )
+        n_tx_ant = int(getattr(tx_array, "num_ant", 0))
+        if n_tx_ant < 1:
+            raise ValueError("The active indoor Sionna TX antenna array is invalid.")
+    else:
+        n_tx_ant = _set_tx_array(scene, original_size, options)
+
+    # The indoor scene is live application state. Preserve its viewport RXs and
+    # scene-level RX array while the shared batched PathSolver uses temporary
+    # map-cell receivers and the Channel Analysis RX configuration.
+    saved_receivers = list(dict(getattr(scene, "receivers", {})).values()) if preserve_scene_transmitters else []
+    previous_rx_array = getattr(scene, "rx_array", None) if preserve_scene_transmitters else None
+    try:
+        n_rx_ant = _set_planar_array(scene, "rx", req.rxArraySize, options.rxPattern, options.rxPolarization)
+        estimated_cfr_samples = _estimate_channel_cfr_samples(
+            pair_count, n_rx_ant, n_tx_ant, int(req.numSubcarriers),
         )
+        if estimated_cfr_samples > MAX_CHANNEL_ANALYSIS_CFR_COMPLEX_SAMPLES:
+            raise ValueError(
+                f"Requested Tx/Rx arrays and subcarrier grid require an estimated "
+                f"{estimated_cfr_samples:,} complex CFR values; limit is "
+                f"{MAX_CHANNEL_ANALYSIS_CFR_COMPLEX_SAMPLES:,}. Reduce selected "
+                f"locations, array size, or CFR subcarriers."
+            )
 
-    tx_specs: list[_TxSpec] = []
-    for original_index in tx_indices:
-        tx = txs[original_index]
-        tx_pos = [float(tx.enu.x), float(tx.enu.y),
-                  _device_z(tx.enu, tx.height, context["buildings"], getattr(tx, "heightReference", None))]
-        tx_specs.append(_TxSpec(
-            pos=tx_pos,
-            beam=_beam_target(tx_pos, tx.beamsteeringAzimuth, tx.beamsteeringElevation),
-            power_dbm=float(tx.powerDbm), id=tx.id, name=tx.name,
-        ))
-    rx_positions = [[float(centers[i, 0]), float(centers[i, 1]), float(centers[i, 2])] for i in cell_indices]
-    rx_velocities = [[0.0, 0.0, 0.0] for _ in rx_positions]
+        tx_specs: list[_TxSpec] = []
+        for original_index in tx_indices:
+            tx = txs[original_index]
+            tx_pos = [float(tx.enu.x), float(tx.enu.y),
+                      _device_z(tx.enu, tx.height, context["buildings"], getattr(tx, "heightReference", None))]
+            tx_specs.append(_TxSpec(
+                pos=tx_pos,
+                beam=_beam_target(tx_pos, tx.beamsteeringAzimuth, tx.beamsteeringElevation),
+                power_dbm=float(tx.powerDbm), id=tx.id, name=tx.name,
+            ))
+        rx_positions = [[float(centers[i, 0]), float(centers[i, 1]), float(centers[i, 2])] for i in cell_indices]
+        rx_velocities = [[0.0, 0.0, 0.0] for _ in rx_positions]
 
-    batch_result = _solve_batched(
-        scene, tx_specs, rx_positions, rx_velocities, n_tx_ant,
-        max_depth=int(context["maxDepth"]), opts=options, return_native=True,
-    )
-    per_rx, native_paths = batch_result
-    # Use native PathSolver APIs on this same single dispatch, not a second solve.
-    a_native, tau_native = native_paths.cir(normalize_delays=False, out_type="numpy")
-    frequency_grid = subcarrier_frequencies(
-        int(req.numSubcarriers), float(req.subcarrierSpacingHz)
-    )
-    frequencies = np.asarray(to_numpy(frequency_grid), dtype=np.float64).reshape(-1)
-    h_native = native_paths.cfr(
-        frequencies=frequency_grid,
-        normalize_delays=False,
-        out_type="numpy",
-    )
-    valid_native = to_numpy(native_paths.valid).astype(bool)
-    if valid_native.ndim != 3:
-        raise ValueError(f"Unexpected PathSolver valid tensor shape {valid_native.shape}; expected [rx,tx,path]")
+        batch_result = _solve_batched(
+            scene, tx_specs, rx_positions, rx_velocities, n_tx_ant,
+            max_depth=int(context["maxDepth"]), opts=options, return_native=True,
+            preserve_tx=preserve_scene_transmitters,
+        )
+        per_rx, native_paths = batch_result
+        # Use native PathSolver APIs on this same single dispatch, not a second solve.
+        a_native, tau_native = native_paths.cir(normalize_delays=False, out_type="numpy")
+        frequency_grid = subcarrier_frequencies(
+            int(req.numSubcarriers), float(req.subcarrierSpacingHz)
+        )
+        frequencies = np.asarray(to_numpy(frequency_grid), dtype=np.float64).reshape(-1)
+        h_native = native_paths.cfr(
+            frequencies=frequency_grid,
+            normalize_delays=False,
+            out_type="numpy",
+        )
+        valid_native = to_numpy(native_paths.valid).astype(bool)
+        if valid_native.ndim != 3:
+            raise ValueError(f"Unexpected PathSolver valid tensor shape {valid_native.shape}; expected [rx,tx,path]")
+    finally:
+        if preserve_scene_transmitters:
+            _clear_receivers(scene)
+            for receiver in saved_receivers:
+                scene.add(receiver)
+            if previous_rx_array is None:
+                if hasattr(scene, "_rx_array"):
+                    scene._rx_array = None
+                else:
+                    scene.rx_array = None
+            else:
+                scene.rx_array = previous_rx_array
 
     locations: list[dict] = []
     tx_local_by_original = {original: local for local, original in enumerate(tx_indices)}
@@ -1527,9 +1667,10 @@ def solve_radio_map_channel_analysis(map_id: str, req: ChannelAnalysisRequest) -
         interferer_index = int(np.argmax(competitor)) if competitor.size else -1
         if not competitor.size or competitor[interferer_index] <= 0:
             interferer_index = -1
+        location_position = {"x": float(centers[cell_index, 0]), "y": float(centers[cell_index, 1]), "z": float(centers[cell_index, 2])}
         locations.append({
             "cellIndex": int(cell_index),
-            "positionEnuM": {"x": float(centers[cell_index, 0]), "y": float(centers[cell_index, 1]), "z": float(centers[cell_index, 2])},
+            ("positionSceneLocalM" if context.get("sceneType") == "indoor" else "positionEnuM"): location_position,
             "radioMap": {
                 "servingTxIndex": serving_index if serving_index >= 0 else None,
                 "servingTxName": txs[serving_index].name if 0 <= serving_index < len(txs) else None,
@@ -1541,6 +1682,7 @@ def solve_radio_map_channel_analysis(map_id: str, req: ChannelAnalysisRequest) -
 
     return {
         "mapId": map_id,
+        "coordinateFrame": "canonical_scene_local" if context.get("sceneType") == "indoor" else "ENU",
         "frequencyGhz": float(context["frequencyGhz"]),
         "maxDepth": int(context["maxDepth"]),
         "numSubcarriers": int(req.numSubcarriers),
@@ -1605,12 +1747,23 @@ def _to_tx_cells(arr, num_tx: int, n_cells: int) -> np.ndarray:
     return a.reshape(num_tx, -1)[:, :n_cells]
 
 
-def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
+def solve_radiomap(
+    req: RadioMapRequest,
+    *,
+    scene_override=None,
+    scene_bounds: dict | None = None,
+    map_height_z: float | None = None,
+    device_positions: dict[str, list[float]] | None = None,
+    devices_prepared: bool = False,
+    prepared_tx_names: list[str] | None = None,
+    scene_context_extra: dict | None = None,
+) -> RadioMapGrid:
     """Compute native Sionna radio maps and research-oriented derived KPIs.
 
-    Native inputs: RadioMap.path_gain, RadioMap.rss, RadioMap.sinr.
-    Derived outputs: interference power, SIR, INR, dominance margin, coverage
-    area/probability, percentiles, CDF and per-transmitter summaries.
+    With no overrides this preserves the outdoor OSM/build_scene workflow.
+    Indoor callers may inject the already activated Sionna scene, canonical
+    scene-local bounds and already registered TX devices. All native outputs,
+    analytics, caching and response construction remain shared.
     """
     import time
     from sionna.rt import RadioMapSolver
@@ -1630,8 +1783,11 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
     )
 
     stage_started = time.perf_counter()
-    scene = build_scene(req.buildings, req.freqGhz, req.materials)
-    logger.debug("Radio-map scene ready in %.2f seconds", time.perf_counter() - stage_started)
+    scene = scene_override if scene_override is not None else build_scene(req.buildings, req.freqGhz, req.materials)
+    logger.debug(
+        "Radio-map scene ready in %.2f seconds (reused_active_scene=%s)",
+        time.perf_counter() - stage_started, scene_override is not None,
+    )
 
     # Set the thermal noise model used by Sionna's SINR calculation.
     # Keep the effective temperature as a plain Python float for analytics.
@@ -1644,18 +1800,38 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
     noise_temperature_k = 293.0 * (10.0 ** (float(req.noiseFigureDb) / 10.0))
     scene.temperature = noise_temperature_k
 
-    xs = [t.enu.x for t in txs]
-    ys = [t.enu.y for t in txs]
-    for b in req.buildings:
-        for p in b.enuPoints:
-            xs.append(p.x)
-            ys.append(p.y)
-    minx, maxx = min(xs), max(xs)
-    miny, maxy = min(ys), max(ys)
-    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
-    size_x = max(maxx - minx, 100.0) + 60.0
-    size_y = max(maxy - miny, 100.0) + 60.0
-    cell = max(float(req.gridSize), 1.0)
+    if scene_bounds is not None:
+        minimum = np.asarray(scene_bounds.get("minimum", []), dtype=np.float64)
+        maximum = np.asarray(scene_bounds.get("maximum", []), dtype=np.float64)
+        if minimum.shape != (3,) or maximum.shape != (3,) or not np.isfinite(minimum).all() or not np.isfinite(maximum).all():
+            raise ValueError("Indoor radio-map scene bounds must contain finite 3D minimum/maximum vectors")
+        if np.any(maximum <= minimum):
+            raise ValueError("Indoor radio-map scene bounds are degenerate")
+        minx, miny = float(minimum[0]), float(minimum[1])
+        maxx, maxy = float(maximum[0]), float(maximum[1])
+        cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+        cell = float(req.gridSize)
+        if not math.isfinite(cell) or cell <= 0.05:
+            raise ValueError("Indoor radio-map gridSize must be greater than 0.05 metres")
+        # Indoor coverage spans the imported room envelope only; do not apply
+        # the 100 m minimum extent and 60 m outdoor padding.
+        size_x = max(maxx - minx, cell)
+        size_y = max(maxy - miny, cell)
+        grid_height_z = float(map_height_z if map_height_z is not None else minimum[2] + float(req.gridHeight))
+    else:
+        xs = [t.enu.x for t in txs]
+        ys = [t.enu.y for t in txs]
+        for b in req.buildings:
+            for p in b.enuPoints:
+                xs.append(p.x)
+                ys.append(p.y)
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+        size_x = max(maxx - minx, 100.0) + 60.0
+        size_y = max(maxy - miny, 100.0) + 60.0
+        cell = max(float(req.gridSize), 1.0)
+        grid_height_z = float(req.gridHeight)
     cells_x = int(math.ceil(size_x / cell))
     cells_y = int(math.ceil(size_y / cell))
     estimated_cells = cells_x * cells_y
@@ -1667,20 +1843,37 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
     array_sizes = [tuple(int(v) for v in t.antennaArraySize) for t in txs]
     if any(size != array_sizes[0] for size in array_sizes):
         raise ValueError("Radio maps with multiple transmitters require matching antennaArraySize")
-    _set_tx_array(scene, txs[0].antennaArraySize, req.options)
+    if devices_prepared:
+        expected_names = list(prepared_tx_names or [])
+        loaded_names = list(dict(getattr(scene, "transmitters", {})).keys())
+        if len(expected_names) != len(txs) or set(expected_names) != set(loaded_names):
+            raise ValueError(
+                "The active indoor Sionna scene TX registry does not match the prepared radio-map transmitters. "
+                "Re-run the indoor radio-map request so the current TX set is applied."
+            )
+        if getattr(scene, "tx_array", None) is None:
+            raise ValueError("The active indoor Sionna scene has no configured TX antenna array.")
+    else:
+        _set_tx_array(scene, txs[0].antennaArraySize, req.options)
+        _clear_devices(scene)
+        for i, t in enumerate(txs):
+            tz = _device_z(t.enu, t.height, req.buildings, getattr(t, "heightReference", None))
+            pos = [float(t.enu.x), float(t.enu.y), tz]
+            beam = _beam_target(pos, t.beamsteeringAzimuth, t.beamsteeringElevation)
+            _place_tx(scene, f"tx_rm_{i}", pos, beam, power_dbm=t.powerDbm)
 
-    _clear_devices(scene)
-    for i, t in enumerate(txs):
-        tz = _device_z(t.enu, t.height, req.buildings, getattr(t, "heightReference", None))
-        pos = [float(t.enu.x), float(t.enu.y), tz]
-        beam = _beam_target(pos, t.beamsteeringAzimuth, t.beamsteeringElevation)
-        _place_tx(scene, f"tx_rm_{i}", pos, beam, power_dbm=t.powerDbm)
+    tx_position_by_id = {
+        t.id: [float(v) for v in device_positions[t.id]]
+        if device_positions is not None and t.id in device_positions
+        else [float(t.enu.x), float(t.enu.y), _device_z(t.enu, t.height, req.buildings, getattr(t, "heightReference", None))]
+        for t in txs
+    }
 
     solver_started = time.perf_counter()
     logger.debug("RadioMapSolver dispatch started")
     rm = RadioMapSolver()(
         scene,
-        center=[cx, cy, float(req.gridHeight)],
+        center=[cx, cy, grid_height_z],
         orientation=[0.0, 0.0, 0.0],
         size=[size_x, size_y],
         cell_size=[cell, cell],
@@ -1716,7 +1909,8 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
             "transmitterLabel": t.transmitterLabel,
             "antennaModel": t.antennaModel,
             "carrierFrequencyGhz": t.carrierFrequencyGhz,
-            "positionEnuM": [float(t.enu.x), float(t.enu.y), _device_z(t.enu, t.height, req.buildings, getattr(t, "heightReference", None))],
+            "positionM": tx_position_by_id[t.id],
+            "coordinateFrame": "canonical_scene_local" if scene_context_extra and scene_context_extra.get("sceneType") == "indoor" else "ENU",
             "heightReference": t.heightReference,
         }
         for t in txs
@@ -1747,6 +1941,7 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
             "maxDepth": int(req.maxDepth),
             "options": req.options,
             "materials": req.materials,
+            **(scene_context_extra or {}),
         },
     )
 
@@ -1824,7 +2019,7 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
                     "carrierFrequencyGhz": t.carrierFrequencyGhz,
                     "latitude": t.latitude,
                     "longitude": t.longitude,
-                    "positionEnuM": [float(t.enu.x), float(t.enu.y), _device_z(t.enu, t.height, req.buildings, getattr(t, "heightReference", None))],
+                    ("positionSceneLocalM" if scene_context_extra and scene_context_extra.get("sceneType") == "indoor" else "positionEnuM"): tx_position_by_id[t.id],
                     "heightM": float(t.height),
                     "heightReference": t.heightReference,
                     "powerDbm": float(t.powerDbm),
@@ -1841,6 +2036,8 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
                 for t in txs
             ],
             "materials": [m.model_dump() for m in req.materials],
+            **({"coordinateFrame": scene_context_extra["coordinateFrame"]} if scene_context_extra and "coordinateFrame" in scene_context_extra else {}),
+            **({"sceneType": "indoor"} if scene_context_extra and scene_context_extra.get("sceneType") == "indoor" else {}),
         },
         samplesPerTx=int(req.samplesPerTx), seed=int(req.seed),
     )

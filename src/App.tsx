@@ -6,9 +6,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { BookOpen } from 'lucide-react';
-import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, defaultMaterialConfig, MeasurementOverlayPoint } from './types';
+import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, defaultMaterialConfig, MeasurementOverlayPoint, TrajectoryPoint } from './types';
 import { ColormapName } from './lib/colormaps';
 import { ThreeStudio } from './components/ThreeStudio';
 import { TopNav } from './components/TopNav';
@@ -23,13 +23,14 @@ import { ExportPanel } from './components/ExportPanel';
 import { FieldValidationPanel } from './components/FieldValidationPanel';
 import { ExperimentPanel } from './components/ExperimentPanel';
 import { BaseStationImportPanel } from './components/BaseStationImportPanel';
+import { SceneImportPanel } from './components/SceneImportPanel';
 import {
   latLonToENU,
   enuToLatLon,
   fetchOSMBuildings,
 } from './utils';
 import { createSolveContextKey, enuPositionChanged } from './lib/solveContext';
-import { solveLink, solveRadioMap, solveMobility, checkBackend, MobilityExecution, MobilityStep, HandoverAnalysis, HandoverConfig, ExperimentRun, createExperimentRecord, getPhyBerStatus, getMeasurementRayTraceJob } from './api';
+import { solveLink, solveIndoorPath, solveIndoorPathMatrix, isIndoorPathSolveResponse, solveRadioMap, solveIndoorRadioMap, solveMobility, solveIndoorMobility, checkBackend, MobilityExecution, MobilityStep, HandoverAnalysis, HandoverConfig, ExperimentRun, createExperimentRecord, getPhyBerStatus, getMeasurementRayTraceJob, SceneImportPreview } from './api';
 import { safeCreateExperiment, safeUpdateExperiment, sha256Json, summarizeUnknownExperimentResult, summarizeMeasurementRayTrace } from './lib/experimentLogging';
 import {
   clearAutosavedProject,
@@ -270,10 +271,24 @@ export default function App() {
   );
 
   // Top navigation view (3D SCENE / GEOGRAPHY / ANALYSIS / EXPORT)
-  const [activeNavTab, setActiveNavTab] = useState<'3d_scene' | 'geography' | 'analysis' | 'field_validation' | 'experiments' | 'export'>(
+  const [activeNavTab, setActiveNavTab] = useState<'3d_scene' | 'scene_import' | 'geography' | 'analysis' | 'field_validation' | 'experiments' | 'export'>(
     () => AUTOSAVED_PROJECT?.display.activeNavTab ?? '3d_scene',
   );
 
+  // The selected indoor import is a staged preview scene until Phase 6 RT
+  // activation. Its canonical coordinates are separate from legacy outdoor ENU.
+  const [indoorScene, setIndoorScene] = useState<SceneImportPreview | null>(null);
+  const handleActiveIndoorSceneChange = useCallback((scene: SceneImportPreview | null) => {
+    setIndoorScene(scene);
+    setPlacementMode('none');
+    if (scene) {
+      setPaths([]);
+      setRadioMap(null);
+      setMatrix({});
+      setMetrics(EMPTY_METRICS);
+      setActiveNavTab('3d_scene');
+    }
+  }, []);
   // Georeferenced field measurements are lifted to App state so they remain
   // visible when navigating from Field Validation back to the 3D scene.
   const [measurementOverlayPoints, setMeasurementOverlayPoints] = useState<MeasurementOverlayPoint[]>([]);
@@ -337,6 +352,22 @@ export default function App() {
   const [coverageSamplesPerTx, setCoverageSamplesPerTx] = useState(
     () => AUTOSAVED_PROJECT?.coverage.samplesPerTx ?? 1_000_000,
   );
+  // Indoor radio maps use scene-local room bounds, so they need finer defaults
+  // than the outdoor kilometre-scale coverage grid. Keep these independent so
+  // switching modes never mutates the user's outdoor preferences.
+  const [indoorCoverageHeight, setIndoorCoverageHeight] = useState(1.2);
+  const [indoorCoverageRes, setIndoorCoverageRes] = useState(0.5);
+  const [indoorCoverageSamplesPerTx, setIndoorCoverageSamplesPerTx] = useState(100_000);
+  const indoorCoverageTxs = React.useMemo(
+    () => indoorScene ? txs.filter((item) => Boolean(item.scenePosition) && item.sceneSessionId === indoorScene.sessionId) : [],
+    [txs, indoorScene],
+  );
+  const indoorCoverageHeightMax = React.useMemo(() => {
+    const bounds = indoorScene?.canonicalBounds;
+    if (!bounds || bounds.minimum.length < 3 || bounds.maximum.length < 3) return 3;
+    const span = Number(bounds.maximum[2]) - Number(bounds.minimum[2]);
+    return Number.isFinite(span) && span > 0.2 ? Math.max(0.1, span - 0.05) : 3;
+  }, [indoorScene]);
   const [radioMapSeed, setRadioMapSeed] = useState(
     () => AUTOSAVED_PROJECT?.coverage.seed ?? 42,
   );
@@ -361,9 +392,51 @@ export default function App() {
   const [downloadProgress, setDownloadProgress] = useState('');
 
   // Trajectory points state
-  const [trajectoryPoints, setTrajectoryPoints] = useState<
-    { lat: number; lon: number; enu: { x: number; y: number; z: number } }[]
-  >(() => AUTOSAVED_PROJECT?.mobility.trajectoryPoints ?? []);
+  const [trajectoryPoints, setTrajectoryPoints] = useState<TrajectoryPoint[]>(
+    () => AUTOSAVED_PROJECT?.mobility.trajectoryPoints ?? [],
+  );
+  // Indoor mobility RX height is measured above the clicked room floor. The
+  // waypoint Z values are absolute canonical scene-local heights.
+  const [indoorMobilityReceiverHeight, setIndoorMobilityReceiverHeight] = useState(() => Math.max(0.1, Math.min(Number(rx.height) || 1.0, 3.0)));
+  // Keep outdoor ENU paths and indoor scene-local paths in one persisted model,
+  // but expose only the active coordinate frame to the panel and 3D viewport.
+  const activeTrajectoryPoints = indoorScene
+    ? trajectoryPoints.filter((point) => point.coordinateFrame === 'indoor_scene_local')
+    : trajectoryPoints.filter((point) => point.coordinateFrame !== 'indoor_scene_local');
+  const setActiveTrajectoryPoints = (points: TrajectoryPoint[]) => {
+    setTrajectoryPoints((previous) => [
+      ...previous.filter((point) => indoorScene
+        ? point.coordinateFrame !== 'indoor_scene_local'
+        : point.coordinateFrame === 'indoor_scene_local'),
+      ...points,
+    ]);
+  };
+  const handleIndoorMobilityReceiverHeightChange = (nextHeight: number) => {
+    const safeHeight = Math.max(0.1, Number(nextHeight) || 1.0);
+    const delta = safeHeight - indoorMobilityReceiverHeight;
+    setIndoorMobilityReceiverHeight(safeHeight);
+    if (Math.abs(delta) < 1e-6) return;
+    const maximumSceneZ = Number(indoorScene?.canonicalBounds?.maximum?.[2]);
+    setActiveTrajectoryPoints(activeTrajectoryPoints.map((point) => {
+      if (point.coordinateFrame !== 'indoor_scene_local') return point;
+      const nextZ = point.enu.z + delta;
+      return {
+        ...point,
+        enu: {
+          ...point.enu,
+          z: Number.isFinite(maximumSceneZ) ? Math.min(nextZ, maximumSceneZ - 0.05) : nextZ,
+        },
+      };
+    }));
+    // A solved result belongs to the old receiver height; force a fresh RT run.
+    setMobilitySteps([]);
+    setActiveMobilityStep(null);
+    setMobilityExecution(null);
+    setMobilityHandover(null);
+    setPaths([]);
+    setMetrics(EMPTY_METRICS);
+    setSolveError('');
+  };
   const [activeMobilityStep, setActiveMobilityStep] = useState<MobilityStep | null>(null);
 
   // Synchronize active Transmitter Lat/Lon ↔ ENU. Changing the active device
@@ -406,6 +479,7 @@ export default function App() {
   const [metrics, setMetrics] = useState<ChannelMetrics>(EMPTY_METRICS);
   const [solving, setSolving] = useState(false);
   const [solveError, setSolveError] = useState<string>('');
+  const [solveInfo, setSolveInfo] = useState<string>('');
   const [backendOnline, setBackendOnline] = useState(false);
   const backendOnlineRef = useRef(backendOnline);
   backendOnlineRef.current = backendOnline;
@@ -451,6 +525,7 @@ export default function App() {
   useEffect(() => {
     setPaths([]);
     setMetrics(EMPTY_METRICS);
+    setSolveInfo('');
     setMatrix({});
     setRadioMap(null);
     setMobilitySteps([]);
@@ -460,24 +535,70 @@ export default function App() {
   const handleSolve = async () => {
     const startedAtUtc = new Date().toISOString();
     const started = performance.now();
-    const requestBody = { tx, rx, buildings, freqGhz, maxDepth, options: solverOptions, materials: materialList };
-    const configuration = { tx, rx, freqGhz, maxDepth, solverOptions, materials: materialList, scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } };
+    const indoorPlacedTxs = indoorScene
+      ? txs.filter((device) => Boolean(device.scenePosition) && device.sceneSessionId === indoorScene.sessionId)
+      : [];
+    const indoorPlacedRxs = indoorScene
+      ? rxs.filter((device) => Boolean(device.scenePosition) && device.sceneSessionId === indoorScene.sessionId)
+      : [];
+    const indoorRequestBody = indoorScene ? {
+      txId: tx.id, rxId: rx.id, txs: indoorPlacedTxs, rxs: indoorPlacedRxs,
+      carrierFrequencyGhz: freqGhz, maxDepth, options: solverOptions,
+    } : null;
+    const requestBody = indoorScene
+      ? indoorRequestBody
+      : { tx, rx, buildings, freqGhz, maxDepth, options: solverOptions, materials: materialList };
+    const configuration = indoorScene
+      ? { tx, rx, freqGhz, maxDepth, solverOptions, scene: { sessionId: indoorScene.sessionId, archiveName: indoorScene.archiveName, coordinateFrame: indoorScene.canonicalFrame } }
+      : { tx, rx, freqGhz, maxDepth, solverOptions, materials: materialList, scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } };
+    const replayEndpoint = indoorScene ? `/api/scene/import/${encodeURIComponent(indoorScene.sessionId)}/path-solve` : '/api/solve';
     let status: 'done' | 'error' = 'done';
     let resultSummary: Record<string, unknown> = {};
     let errorText: string | null = null;
     setSolving(true);
     setSolveError('');
+    setSolveInfo('');
     try {
-      const res = await solveLink(tx, rx, buildings, freqGhz, maxDepth, solverOptions, materialList);
+      if (indoorScene) {
+        if (!tx.scenePosition || !rx.scenePosition || tx.sceneSessionId !== indoorScene.sessionId || rx.sceneSessionId !== indoorScene.sessionId) {
+          throw new Error('Place the selected TX and RX in the active indoor scene before running PathSolver.');
+        }
+        if (!indoorPlacedTxs.some((device) => device.id === tx.id) || !indoorPlacedRxs.some((device) => device.id === rx.id)) {
+          throw new Error('The selected TX/RX pair is not part of the currently placed devices in this indoor scene.');
+        }
+      }
+      const res = indoorScene
+        ? await solveIndoorPath(indoorScene.sessionId, {
+            txId: tx.id,
+            rxId: rx.id,
+            txs: indoorPlacedTxs,
+            rxs: indoorPlacedRxs,
+            carrierFrequencyGhz: freqGhz,
+            maxDepth,
+            options: solverOptions,
+          })
+        : await solveLink(tx, rx, buildings, freqGhz, maxDepth, solverOptions, materialList);
       setPaths(res.paths);
       setMetrics(res.metrics);
       setMatrixRaysVisible(false); // focus the 3D scene on this single link
       setBackendOnline(true);
       resultSummary = summarizeUnknownExperimentResult('link_solve', res);
+      if (indoorScene) {
+        if (!isIndoorPathSolveResponse(res)) {
+          throw new Error('Indoor PathSolver returned an unexpected response payload.');
+        }
+        const run = res.execution;
+        setSolveInfo(
+          run.status === 'completed'
+            ? `Sionna RT PathSolver completed in ${(run.solveTimeMs / 1000).toFixed(2)} s · ${run.validPathCount} valid path(s) · ${run.mitsubaVariant}`
+            : `Sionna RT PathSolver executed in ${(run.solveTimeMs / 1000).toFixed(2)} s but found no valid paths. Check TX/RX placement, LOS/reflection settings and scene geometry.`,
+        );
+      }
     } catch (e: any) {
       status = 'error';
       errorText = e?.message || 'Solve failed';
       setSolveError(errorText);
+      setSolveInfo('');
       checkBackend().then(setBackendOnline); // a solve error != backend offline
     } finally {
       setSolving(false);
@@ -487,30 +608,104 @@ export default function App() {
         seed: solverOptions.pathSeed, configuration,
         parameters: { txId: tx.id, rxId: rx.id, freqGhz, maxDepth, pathSamplesPerSource: solverOptions.pathSamplesPerSource, seed: solverOptions.pathSeed, buildingCount: buildings.length },
         results: resultSummary, error: errorText,
-        replay: { endpoint: '/api/solve', body: requestBody, description: 'Repeat the exact single-link PathSolver request' },
+        replay: { endpoint: replayEndpoint, body: requestBody, description: 'Repeat the exact single-link PathSolver request' },
       });
     }
   };
 
-  // Solve every Tx → Rx pair (serial GPU ray traces, scene is cached).
+  // Solve every Tx → Rx combination. Outdoor retains its established serial
+  // per-pair API. Indoor submits the full placed device snapshot once; Sionna's
+  // native Paths tensors already contain every RX×TX combination, so the
+  // backend extracts the complete matrix from one PathSolver dispatch.
   const handleSolveMatrix = async () => {
+    const indoorPlacedTxs = indoorScene
+      ? txs.filter((device) => Boolean(device.scenePosition) && device.sceneSessionId === indoorScene.sessionId)
+      : [];
+    const indoorPlacedRxs = indoorScene
+      ? rxs.filter((device) => Boolean(device.scenePosition) && device.sceneSessionId === indoorScene.sessionId)
+      : [];
+
+    if (indoorScene) {
+      const missingTxs = txs.filter((device) => !device.scenePosition || device.sceneSessionId !== indoorScene.sessionId);
+      const missingRxs = rxs.filter((device) => !device.scenePosition || device.sceneSessionId !== indoorScene.sessionId);
+      if (missingTxs.length || missingRxs.length) {
+        const missing = [
+          ...missingTxs.map((device) => device.name),
+          ...missingRxs.map((device) => device.name),
+        ];
+        setSolveError(`Place every TX and RX in the active indoor scene before solving the matrix. Not placed: ${missing.join(', ')}.`);
+        return;
+      }
+      if (!indoorPlacedTxs.length || !indoorPlacedRxs.length) {
+        setSolveError('Place at least one TX and one RX in the active indoor scene before solving the matrix.');
+        return;
+      }
+    }
+
     const startedAtUtc = new Date().toISOString();
     const started = performance.now();
     const next: Record<string, MatrixCell> = {};
-    const total = txs.length * rxs.length;
+    const matrixTxs = indoorScene ? indoorPlacedTxs : txs;
+    const matrixRxs = indoorScene ? indoorPlacedRxs : rxs;
+    const total = matrixTxs.length * matrixRxs.length;
     let done = 0;
     let status: 'done' | 'error' = 'done';
     let errorText: string | null = null;
+    let resultSummary: Record<string, unknown> = {};
     setMatrixLoading(true);
     setSolveError('');
+    setSolveInfo('');
     try {
-      for (const t of txs) {
-        for (const r of rxs) {
-          done += 1;
-          setMatrixProgress(`${t.name} → ${r.name}  (${done}/${total})`);
-          const res = await solveLink(t, r, buildings, freqGhz, maxDepth, solverOptions, materialList);
-          next[`${t.id}|${r.id}`] = { txId: t.id, rxId: r.id, metrics: res.metrics, paths: res.paths };
+      if (indoorScene) {
+        setMatrixProgress(`Tracing ${matrixTxs.length} TX × ${matrixRxs.length} RX (${total} links) in one Sionna RT dispatch…`);
+        const response = await solveIndoorPathMatrix(indoorScene.sessionId, {
+          txs: indoorPlacedTxs,
+          rxs: indoorPlacedRxs,
+          carrierFrequencyGhz: freqGhz,
+          maxDepth,
+          options: solverOptions,
+        });
+        for (const pair of response.pairs) {
+          next[`${pair.txId}|${pair.rxId}`] = {
+            txId: pair.txId,
+            rxId: pair.rxId,
+            metrics: pair.metrics,
+            paths: pair.paths,
+          };
         }
+        done = response.execution.totalPairs;
+        const pairSummaries = response.pairs.map((pair) => ({
+          txId: pair.txId,
+          rxId: pair.rxId,
+          pathCount: pair.execution.validPathCount,
+          metrics: pair.metrics,
+          execution: pair.execution,
+        }));
+        resultSummary = { solvedPairs: pairSummaries, execution: response.execution };
+        setSolveInfo(
+          `Sionna RT PathSolver completed in ${(response.execution.solveTimeMs / 1000).toFixed(2)} s · ${done} TX×RX links · ${response.execution.pairsWithPaths} with paths · ${response.execution.mitsubaVariant}`,
+        );
+      } else {
+        for (const t of matrixTxs) {
+          for (const r of matrixRxs) {
+            done += 1;
+            setMatrixProgress(`${t.name} → ${r.name}  (${done}/${total})`);
+            const res = await solveLink(t, r, buildings, freqGhz, maxDepth, solverOptions, materialList);
+            next[`${t.id}|${r.id}`] = { txId: t.id, rxId: r.id, metrics: res.metrics, paths: res.paths };
+          }
+        }
+        resultSummary = {
+          solvedPairs: Object.values(next).map((cell) => ({
+            txId: cell.txId,
+            rxId: cell.rxId,
+            pathCount: cell.paths.length,
+            metrics: cell.metrics,
+          })),
+        };
+      }
+
+      if (Object.keys(next).length !== total) {
+        throw new Error(`PathSolver returned ${Object.keys(next).length} link results, but ${total} TX×RX combinations were requested.`);
       }
       setMatrix(next);
       setMatrixRaysVisible(true); // show every pair's rays until a pair is focused
@@ -520,19 +715,34 @@ export default function App() {
     } catch (e: any) {
       status = 'error'; errorText = e?.message || 'Matrix solve failed';
       setSolveError(errorText);
+      setSolveInfo('');
       checkBackend().then(setBackendOnline);
     } finally {
       setMatrixLoading(false);
       setMatrixProgress('');
       const pairSummaries = Object.values(next).map((cell) => ({ txId: cell.txId, rxId: cell.rxId, pathCount: cell.paths.length, metrics: cell.metrics }));
+      const configuration = indoorScene
+        ? { txs: indoorPlacedTxs, rxs: indoorPlacedRxs, freqGhz, maxDepth, solverOptions, scene: { sessionId: indoorScene.sessionId, archiveName: indoorScene.archiveName, coordinateFrame: indoorScene.canonicalFrame } }
+        : { txs, rxs, freqGhz, maxDepth, solverOptions, materials: materialList, scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } };
+      const replay = indoorScene
+        ? {
+            endpoint: `/api/scene/import/${encodeURIComponent(indoorScene.sessionId)}/path-solve-matrix`,
+            body: { txs: indoorPlacedTxs, rxs: indoorPlacedRxs, carrierFrequencyGhz: freqGhz, maxDepth, options: solverOptions },
+            description: 'Repeat every indoor transmitter–receiver combination in one Sionna RT PathSolver dispatch',
+          }
+        : {
+            endpoint: '/api/solve',
+            body: { kind: 'link_matrix', txs, rxs, buildings, freqGhz, maxDepth, options: solverOptions, materials: materialList },
+            description: 'Repeat every transmitter–receiver pair in the link matrix',
+          };
       await safeCreateExperiment({
-        name: `All-pairs link matrix · ${txs.length} TX × ${rxs.length} RX`, kind: 'link_matrix', status,
+        name: `All-pairs link matrix · ${matrixTxs.length} TX × ${matrixRxs.length} RX`, kind: 'link_matrix', status,
         startedAtUtc, completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
         seed: solverOptions.pathSeed,
-        configuration: { txs, rxs, freqGhz, maxDepth, solverOptions, materials: materialList, scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } },
-        parameters: { txCount: txs.length, rxCount: rxs.length, totalPairs: total, solvedPairs: Object.keys(next).length, freqGhz, maxDepth, pathSamplesPerSource: solverOptions.pathSamplesPerSource, seed: solverOptions.pathSeed },
-        results: { solvedPairs: pairSummaries }, error: errorText,
-        replay: { endpoint: '/api/solve', body: { kind: 'link_matrix', txs, rxs, buildings, freqGhz, maxDepth, options: solverOptions, materials: materialList }, description: 'Repeat every transmitter–receiver pair in the link matrix' },
+        configuration,
+        parameters: { txCount: matrixTxs.length, rxCount: matrixRxs.length, totalPairs: total, solvedPairs: Object.keys(next).length, freqGhz, maxDepth, pathSamplesPerSource: solverOptions.pathSamplesPerSource, seed: solverOptions.pathSeed },
+        results: { ...resultSummary, solvedPairs: resultSummary.solvedPairs ?? pairSummaries }, error: errorText,
+        replay,
       });
     }
   };
@@ -579,7 +789,11 @@ export default function App() {
   const addTx = () => {
     const enu = { x: tx.enu.x + 30, y: tx.enu.y - 20, z: 0 };
     const ll = enuToLatLon(enu, anchor);
-    const nt: Transmitter = { ...tx, id: `tx_${Date.now()}`, name: `Tx ${txs.length + 1}`, enu, latitude: ll.lat, longitude: ll.lon };
+    const nt: Transmitter = {
+      ...tx, id: `tx_${Date.now()}`, name: `Tx ${txs.length + 1}`, enu,
+      latitude: ll.lat, longitude: ll.lon,
+      ...(indoorScene ? { sceneSessionId: indoorScene.sessionId, scenePosition: undefined, sceneNormal: undefined, sceneOrientation: undefined, sceneSurface: undefined } : {}),
+    };
     setTxs((p) => [...p, nt]);
     setActiveTxId(nt.id);
     setPlacementMode('tx'); // arm: next click in the 3D scene positions the new Tx
@@ -593,7 +807,11 @@ export default function App() {
   const addRx = () => {
     const enu = { x: rx.enu.x - 30, y: rx.enu.y + 20, z: 0 };
     const ll = enuToLatLon(enu, anchor);
-    const nr: Receiver = { ...rx, id: `rx_${Date.now()}`, name: `Rx ${rxs.length + 1}`, enu, latitude: ll.lat, longitude: ll.lon };
+    const nr: Receiver = {
+      ...rx, id: `rx_${Date.now()}`, name: `Rx ${rxs.length + 1}`, enu,
+      latitude: ll.lat, longitude: ll.lon,
+      ...(indoorScene ? { sceneSessionId: indoorScene.sessionId, scenePosition: undefined, sceneNormal: undefined, sceneOrientation: undefined, sceneSurface: undefined } : {}),
+    };
     setRxs((p) => [...p, nr]);
     setActiveRxId(nr.id);
     setPlacementMode('rx'); // arm: next click in the 3D scene positions the new Rx
@@ -607,11 +825,19 @@ export default function App() {
 
   // Custom coordinate transmitter coordinate update callback (active device).
   const handleTxUpdate = (updatedTx: Transmitter) => {
-    // Re-evaluate Lat/Lon back from ENU coordinate updates
+    // Indoor poses are canonical scene-local metres, never ENU/GPS. Preserve
+    // the legacy geographic fields unchanged until the indoor solver adapter
+    // is introduced in Phase 6.
+    if (indoorScene && (!updatedTx.sceneSessionId || updatedTx.sceneSessionId === indoorScene.sessionId)) {
+      setTxs((prev) => prev.map((item) => item.id === updatedTx.id
+        ? { ...updatedTx, sceneSessionId: indoorScene.sessionId }
+        : item));
+      return;
+    }
     const latLon = enuToLatLon(updatedTx.enu, anchor);
-    setTxs((prev) =>
-      prev.map((t) => (t.id === updatedTx.id ? { ...updatedTx, latitude: latLon.lat, longitude: latLon.lon } : t)),
-    );
+    setTxs((prev) => prev.map((item) => item.id === updatedTx.id
+      ? { ...updatedTx, latitude: latLon.lat, longitude: latLon.lon }
+      : item));
   };
 
   const handleImportBaseStations = (imported: Transmitter[], replaceExisting: boolean) => {
@@ -652,10 +878,16 @@ export default function App() {
   };
 
   const handleRxUpdate = (updatedRx: Receiver) => {
+    if (indoorScene && (!updatedRx.sceneSessionId || updatedRx.sceneSessionId === indoorScene.sessionId)) {
+      setRxs((prev) => prev.map((item) => item.id === updatedRx.id
+        ? { ...updatedRx, sceneSessionId: indoorScene.sessionId }
+        : item));
+      return;
+    }
     const latLon = enuToLatLon(updatedRx.enu, anchor);
-    setRxs((prev) =>
-      prev.map((r) => (r.id === updatedRx.id ? { ...updatedRx, latitude: latLon.lat, longitude: latLon.lon } : r)),
-    );
+    setRxs((prev) => prev.map((item) => item.id === updatedRx.id
+      ? { ...updatedRx, latitude: latLon.lat, longitude: latLon.lon }
+      : item));
   };
 
   // OVERPASS GIS DOWNLOAD PIPELINE. `buildings` is the authoritative OSM feature
@@ -854,36 +1086,44 @@ export default function App() {
   // Each sample is a full GPU ray trace, so cap the trajectory resolution.
   const MAX_MOBILITY_STEPS = 100;
 
-  const sampleMobilityPath = (intervalMs: number, speedKmh: number) => {
-    if (trajectoryPoints.length < 2) return trajectoryPoints;
-    const speedMs = Math.max(speedKmh / 3.6, 0.1);
-    const stepMeters = Math.max(speedMs * (intervalMs / 1000), 0.05);
+  const sampleMobilityPath = (
+    intervalMs: number,
+    speedKmh: number,
+    sourcePoints: TrajectoryPoint[] = activeTrajectoryPoints,
+  ) => {
+    if (sourcePoints.length < 2) return sourcePoints;
+    // Respect sub-walking speeds (e.g. indoor robot/slow pedestrian motion).
+    // The distance floor is 0.1 mm, not 5 cm, so short RT intervals do not
+    // silently turn a requested 0.1–1 km/h into a much faster trajectory.
+    const speedMs = Math.max(speedKmh / 3.6, 1e-3);
+    const stepMeters = Math.max(speedMs * (intervalMs / 1000), 1e-4);
 
     // Cumulative arc length along the drawn polyline.
     const cum = [0];
-    for (let i = 1; i < trajectoryPoints.length; i++) {
-      const a = trajectoryPoints[i - 1].enu;
-      const b = trajectoryPoints[i].enu;
+    for (let i = 1; i < sourcePoints.length; i++) {
+      const a = sourcePoints[i - 1].enu;
+      const b = sourcePoints[i].enu;
       cum.push(cum[i - 1] + Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z));
     }
     const total = cum[cum.length - 1];
-    if (total < 1e-6) return [trajectoryPoints[0]];
+    if (total < 1e-6) return [sourcePoints[0]];
 
     const numSegments = Math.min(
       Math.max(Math.ceil(total / stepMeters), 1),
       MAX_MOBILITY_STEPS - 1,
     );
-    const sampled: typeof trajectoryPoints = [];
+    const sampled: TrajectoryPoint[] = [];
     let seg = 1;
     for (let s = 0; s <= numSegments; s++) {
       const d = (s / numSegments) * total;
       while (seg < cum.length - 1 && cum[seg] < d) seg++;
       const t = (d - cum[seg - 1]) / Math.max(cum[seg] - cum[seg - 1], 1e-9);
-      const a = trajectoryPoints[seg - 1];
-      const b = trajectoryPoints[seg];
+      const a = sourcePoints[seg - 1];
+      const b = sourcePoints[seg];
       sampled.push({
         lat: a.lat + (b.lat - a.lat) * t,
         lon: a.lon + (b.lon - a.lon) * t,
+        coordinateFrame: a.coordinateFrame ?? b.coordinateFrame,
         enu: {
           x: a.enu.x + (b.enu.x - a.enu.x) * t,
           y: a.enu.y + (b.enu.y - a.enu.y) * t,
@@ -895,8 +1135,16 @@ export default function App() {
   };
 
   const handleRunMobility = async (speedKmh: number, intervalMs: number) => {
-    if (trajectoryPoints.length < 2) {
-      setSolveError('Draw at least two mobility waypoints in the 3D scene.');
+    const isIndoor = Boolean(indoorScene);
+    const mobilityTxs = isIndoor
+      ? txs.filter((device) => Boolean(device.scenePosition) && device.sceneSessionId === indoorScene!.sessionId)
+      : txs;
+    if (isIndoor && mobilityTxs.length === 0) {
+      setSolveError('Place at least one TX in the active indoor scene before running mobility.');
+      return;
+    }
+    if (activeTrajectoryPoints.length < 2) {
+      setSolveError('Draw at least two waypoints in the active scene.');
       return;
     }
     const startedAtUtc = new Date().toISOString();
@@ -906,6 +1154,9 @@ export default function App() {
     let errorText: string | null = null;
     let replayBody: Record<string, unknown> = {};
     let waypointCount = 0;
+    const endpoint = isIndoor
+      ? `/api/scene/import/${encodeURIComponent(indoorScene!.sessionId)}/mobility`
+      : '/api/mobility';
     setMobilityLoading(true);
     setSolveError('');
     try {
@@ -913,21 +1164,37 @@ export default function App() {
       setMobilitySteps([]);
       setMobilityExecution(null);
       setMobilityHandover(null);
-      const sampledPath = sampleMobilityPath(intervalMs, speedKmh);
-      setTrajectoryPoints(sampledPath);
-      const waypoints = sampledPath.map((p) => ({ x: p.enu.x, y: p.enu.y, z: p.enu.z }));
+      const sampledPath = sampleMobilityPath(intervalMs, speedKmh, activeTrajectoryPoints);
+      setActiveTrajectoryPoints(sampledPath);
+      const waypoints = sampledPath.map((point) => ({ x: point.enu.x, y: point.enu.y, z: point.enu.z }));
       waypointCount = waypoints.length;
-      replayBody = { txs, rx, buildings, waypoints, freqGhz, speedKmh, maxDepth, options: solverOptions, materials: materialList, combineMode: mobilityCombineMode, executionMode: 'auto', handover: handoverConfig };
 
-      // One API request preserves the backend's one-PathSolver-dispatch fast
-      // path over all Tx × waypoints and makes the browser workflow identical
-      // to the benchmarked workflow. The response exposes any serial fallback.
-      setMobilityProgress(`Batching ${txs.length} Tx × ${waypoints.length} positions on the GPU…`);
-      const res = await solveMobility(
-        txs, rx, buildings, waypoints,
-        freqGhz, speedKmh, maxDepth, solverOptions, materialList, mobilityCombineMode,
-        'auto', handoverConfig,
-      );
+      const request = {
+        txs: mobilityTxs,
+        rx,
+        waypoints,
+        freqGhz,
+        speedKmh,
+        maxDepth,
+        options: solverOptions,
+        combineMode: mobilityCombineMode,
+        executionMode: 'auto' as const,
+        handover: handoverConfig,
+      };
+      replayBody = isIndoor
+        ? request
+        : { ...request, buildings, materials: materialList };
+
+      // Both modes use the same per-Tx × waypoint PathSolver batch and A3
+      // post-processing. Indoor switches only the route/active-scene adapter.
+      setMobilityProgress(`Batching ${mobilityTxs.length} Tx × ${waypoints.length} positions on the GPU…`);
+      const res = isIndoor
+        ? await solveIndoorMobility(indoorScene!.sessionId, request)
+        : await solveMobility(
+            mobilityTxs, rx, buildings, waypoints,
+            freqGhz, speedKmh, maxDepth, solverOptions, materialList, mobilityCombineMode,
+            'auto', handoverConfig,
+          );
       const all = res.steps.map((step, index) => ({ ...step, index }));
       setMobilityExecution(res.execution);
       setMobilityHandover(res.handover ?? null);
@@ -944,13 +1211,19 @@ export default function App() {
       setMobilityLoading(false);
       setMobilityProgress('');
       await safeCreateExperiment({
-        name: `Mobility · ${txs.length} TX · ${waypointCount || trajectoryPoints.length} waypoints`, kind: 'mobility', status,
+        name: `Mobility · ${mobilityTxs.length} TX · ${waypointCount || activeTrajectoryPoints.length} waypoints`, kind: 'mobility', status,
         startedAtUtc, completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
         seed: solverOptions.pathSeed,
-        configuration: { txs, rx, freqGhz, maxDepth, solverOptions, materials: materialList, mobilityCombineMode, handoverConfig, scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } },
-        parameters: { speedKmh, intervalMs, waypointCount, txCount: txs.length, combineMode: mobilityCombineMode, handover: handoverConfig, seed: solverOptions.pathSeed },
+        configuration: {
+          txs: mobilityTxs, rx, freqGhz, maxDepth, solverOptions, materials: isIndoor ? [] : materialList,
+          mobilityCombineMode, handoverConfig,
+          scene: isIndoor
+            ? { type: 'indoor', sessionId: indoorScene!.sessionId, archiveName: indoorScene!.archiveName, coordinateFrame: indoorScene!.canonicalFrame, canonicalBounds: indoorScene!.canonicalBounds }
+            : { type: 'outdoor', anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint },
+        },
+        parameters: { speedKmh, intervalMs, waypointCount, txCount: mobilityTxs.length, combineMode: mobilityCombineMode, handover: handoverConfig, seed: solverOptions.pathSeed },
         results: resultSummary, error: errorText,
-        replay: status === 'done' ? { endpoint: '/api/mobility', body: replayBody, description: 'Repeat mobility path simulation' } : { endpoint: '/api/mobility', body: replayBody, description: 'Retry failed mobility path simulation' },
+        replay: { endpoint, body: replayBody, description: status === 'done' ? 'Repeat mobility path simulation' : 'Retry failed mobility path simulation' },
       });
     }
   };
@@ -962,23 +1235,36 @@ export default function App() {
     setMetrics(metricsFromMobilityStep(step));
   };
 
-  // COVERAGE HEATMAP — real Sionna RadioMapSolver, best-server across all Tx.
+  // COVERAGE HEATMAP — shared Sionna RadioMapSolver. Outdoor uses the OSM
+  // request unchanged; indoor injects the already-activated scene and local bounds.
   const handleRunHeatmap = async (resolution: number, height: number, samplesPerTx: number, seed: number) => {
-    if (coverageBandOptions.length > 1 && coverageBandFilter === '__all__') {
-      setSolveError('Multiple frequency-band groups were imported. Select one Frequency Band group before computing a radio map; different bands must not be treated as co-channel interferers.');
-      return;
+    const isIndoor = Boolean(indoorScene);
+    let selectedTransmitters: Transmitter[];
+
+    if (isIndoor) {
+      selectedTransmitters = indoorCoverageTxs;
+      if (!selectedTransmitters.length) {
+        setSolveError('Place at least one TX in the active indoor scene before computing a radio map.');
+        return;
+      }
+    } else {
+      if (coverageBandOptions.length > 1 && coverageBandFilter === '__all__') {
+        setSolveError('Multiple frequency-band groups were imported. Select one Frequency Band group before computing a radio map; different bands must not be treated as co-channel interferers.');
+        return;
+      }
+      selectedTransmitters = coverageBandFilter !== '__all__' ? coverageTxs : txs;
+      const mixedClassifiedAndUnclassified = selectedTransmitters.some((item) => !item.frequencyBand)
+        && selectedTransmitters.some((item) => Boolean(item.frequencyBand));
+      if (mixedClassifiedAndUnclassified) {
+        setSolveError('The selected group contains transmitters both with and without Frequency Band metadata. Remove unclassified transmitters or re-import the table using Replace current transmitters.');
+        return;
+      }
+      if (!selectedTransmitters.length) {
+        setSolveError('The selected Frequency Band group contains no transmitters.');
+        return;
+      }
     }
-    const selectedTransmitters = coverageBandFilter !== '__all__' ? coverageTxs : txs;
-    const mixedClassifiedAndUnclassified = selectedTransmitters.some((item) => !item.frequencyBand)
-      && selectedTransmitters.some((item) => Boolean(item.frequencyBand));
-    if (mixedClassifiedAndUnclassified) {
-      setSolveError('The selected group contains transmitters both with and without Frequency Band metadata. Remove unclassified transmitters or re-import the table using Replace current transmitters.');
-      return;
-    }
-    if (!selectedTransmitters.length) {
-      setSolveError('The selected Frequency Band group contains no transmitters.');
-      return;
-    }
+
     const knownCarriers: number[] = Array.from(new Set<number>(selectedTransmitters
       .map((item) => item.carrierFrequencyGhz)
       .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))));
@@ -990,35 +1276,47 @@ export default function App() {
       setSolveError(`The RF controls are set to ${freqGhz} GHz, but the imported table lists ${knownCarriers[0]} GHz for the selected group. Align the carrier frequency before running the calculation.`);
       return;
     }
-    const hasImportedBandWithoutExactCarrier = selectedTransmitters.some(
-      (item) => Boolean(item.frequencyBand) && !Number.isFinite(item.carrierFrequencyGhz),
-    );
-    const selectedBandKey = coverageBandFilter !== '__all__' ? coverageBandFilter : '__all__';
-    if (hasImportedBandWithoutExactCarrier && confirmedCarrierBand !== selectedBandKey) {
-      setSolveError('The table contains a Frequency Band label but no exact carrier frequency. Select a band group, enter the deployed downlink carrier in RF Controls, and only then run the radio map. Labels such as n78, GSM 900, or 791/2110 MHz are not sufficient to determine the channel.');
-      return;
+    if (!isIndoor) {
+      const hasImportedBandWithoutExactCarrier = selectedTransmitters.some(
+        (item) => Boolean(item.frequencyBand) && !Number.isFinite(item.carrierFrequencyGhz),
+      );
+      const selectedBandKey = coverageBandFilter !== '__all__' ? coverageBandFilter : '__all__';
+      if (hasImportedBandWithoutExactCarrier && confirmedCarrierBand !== selectedBandKey) {
+        setSolveError('The table contains a Frequency Band label but no exact carrier frequency. Select a band group, enter the deployed downlink carrier in RF Controls, and only then run the radio map. Labels such as n78, GSM 900, or 791/2110 MHz are not sufficient to determine the channel.');
+        return;
+      }
     }
+
+    const solveHeight = isIndoor ? Math.min(height, indoorCoverageHeightMax) : height;
     const startedAtUtc = new Date().toISOString();
     const started = performance.now();
     const coverageRequest = { metric: coverageMetric, coverageThresholdDb, rssCoverageThresholdDb: -100, sinrCoverageThresholdDb: 0, bandwidthHz: coverageBandwidthMhz * 1e6, noiseFigureDb: coverageNoiseFigureDb, samplesPerTx, seed };
-    const replayBody = { txs: selectedTransmitters, buildings, freqGhz, gridSize: resolution, gridHeight: height, maxDepth, options: solverOptions, materials: materialList, ...coverageRequest };
+    const replayBody = isIndoor
+      ? { txs: selectedTransmitters, freqGhz, gridSize: resolution, gridHeight: solveHeight, maxDepth, options: solverOptions, ...coverageRequest }
+      : { txs: selectedTransmitters, buildings, freqGhz, gridSize: resolution, gridHeight: solveHeight, maxDepth, options: solverOptions, materials: materialList, ...coverageRequest };
+    const replayEndpoint = isIndoor && indoorScene
+      ? `/api/scene/import/${encodeURIComponent(indoorScene.sessionId)}/radiomap`
+      : '/api/radiomap';
     let status: 'done' | 'error' = 'done';
     let resultSummary: Record<string, unknown> = {};
     let errorText: string | null = null;
     setLoadingHeatmap(true);
     setSolveError('');
     try {
-      const grid = await solveRadioMap(
-        selectedTransmitters, buildings, freqGhz, resolution, height, maxDepth, solverOptions, materialList,
-        coverageRequest,
-      );
-      setRadioMap({
+      const grid = isIndoor && indoorScene
+        ? await solveIndoorRadioMap(
+          indoorScene.sessionId, selectedTransmitters, freqGhz, resolution, solveHeight, maxDepth, solverOptions, coverageRequest,
+        )
+        : await solveRadioMap(
+          selectedTransmitters, buildings, freqGhz, resolution, solveHeight, maxDepth, solverOptions, materialList, coverageRequest,
+        );
+      setRadioMap(isIndoor ? { ...grid, geoReference: null } : {
         ...grid,
         geoReference: {
           crs: 'EPSG:4326',
           anchor: { ...anchor },
           method: 'WGS84_LOCAL_TANGENT_ENU',
-          note: 'Local WGS84 tangent-plane ENU conversion; accuracy depends on the scene anchor and is intended for local-area scenes.',
+          note: 'Local WGS84 tangent-plane conversion; accuracy depends on the scene anchor and is intended for local-area scenes.',
         },
       });
       resultSummary = summarizeUnknownExperimentResult('radio_map', grid);
@@ -1031,12 +1329,14 @@ export default function App() {
     } finally {
       setLoadingHeatmap(false);
       await safeCreateExperiment({
-        name: `Radio map · ${coverageMetric} · ${selectedTransmitters.length} TX`, kind: 'radio_map', status,
+        name: `${isIndoor ? 'Indoor radio map' : 'Radio map'} · ${coverageMetric} · ${selectedTransmitters.length} TX`, kind: 'radio_map', status,
         startedAtUtc, completedAtUtc: new Date().toISOString(), durationMs: performance.now() - started,
-        seed, configuration: { txs: selectedTransmitters, freqGhz, maxDepth, solverOptions, materials: materialList, coverageRequest, scene: { anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } },
-        parameters: { metric: coverageMetric, gridSize: resolution, gridHeight: height, samplesPerTx, seed, noiseFigureDb: coverageNoiseFigureDb, bandwidthHz: coverageBandwidthMhz * 1e6, maxDepth, frequencyGhz: freqGhz, transmitterCount: selectedTransmitters.length },
+        seed, configuration: { txs: selectedTransmitters, freqGhz, maxDepth, solverOptions, materials: isIndoor ? [] : materialList, coverageRequest, scene: isIndoor && indoorScene
+          ? { type: 'indoor', sessionId: indoorScene.sessionId, archiveName: indoorScene.archiveName, coordinateFrame: indoorScene.canonicalFrame, canonicalBounds: indoorScene.canonicalBounds }
+          : { type: 'outdoor', anchor, buildingCount: buildings.length, geometryFingerprint: sceneGeometryFingerprint } },
+        parameters: { metric: coverageMetric, gridSize: resolution, gridHeight: solveHeight, samplesPerTx, seed, noiseFigureDb: coverageNoiseFigureDb, bandwidthHz: coverageBandwidthMhz * 1e6, maxDepth, frequencyGhz: freqGhz, transmitterCount: selectedTransmitters.length, coordinateFrame: isIndoor ? 'scene-local' : 'ENU' },
         results: resultSummary, error: errorText,
-        replay: { endpoint: '/api/radiomap', body: replayBody, description: 'Repeat RadioMapSolver run' },
+        replay: { endpoint: replayEndpoint, body: replayBody, description: isIndoor ? 'Repeat indoor RadioMapSolver run on the active imported scene' : 'Repeat RadioMapSolver run' },
       });
     }
   };
@@ -1103,7 +1403,27 @@ export default function App() {
     let retryWasCancelled = false;
     try {
       let raw: any;
-      if (experiment.kind === 'link_matrix' && Array.isArray((replay.body as any).txs) && Array.isArray((replay.body as any).rxs)) {
+      if (experiment.kind === 'link_matrix' && replay.endpoint.includes('/path-solve-matrix')
+          && Array.isArray((replay.body as any).txs) && Array.isArray((replay.body as any).rxs)) {
+        const response = await fetch(replay.endpoint, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(replay.body),
+        });
+        if (!response.ok) {
+          let detail = `Indoor link matrix retry failed (${response.status})`;
+          try { const body = await response.json(); detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail ?? body); } catch { /* keep fallback */ }
+          throw new Error(detail);
+        }
+        const matrixResult = await response.json();
+        raw = {
+          execution: matrixResult.execution,
+          solvedPairs: (matrixResult.pairs ?? []).map((pair: any) => ({
+            txId: pair.txId, rxId: pair.rxId,
+            pathCount: pair.execution?.validPathCount ?? pair.paths?.length ?? 0,
+            metrics: pair.metrics,
+          })),
+        };
+      } else if (experiment.kind === 'link_matrix' && Array.isArray((replay.body as any).txs) && Array.isArray((replay.body as any).rxs)) {
         const matrix = replay.body as any;
         const solvedPairs: any[] = [];
         for (const t of matrix.txs) {
@@ -1189,8 +1509,11 @@ export default function App() {
       {/* Main container Grid body */}
       <main className="flex-1 lg:min-h-0 p-6 grid grid-cols-1 lg:grid-cols-[430px_minmax(0,1fr)] gap-6 w-full">
         {/* Left column GIS mapping & parameter adjustments (4/12, 3/12 on wide screens) */}
-        <div className="flex flex-col gap-6 animate-rise lg:min-h-0 lg:overflow-y-auto lg:pr-1">
-          <MapSelector
+        <div
+          className="flex flex-col gap-6 animate-rise lg:min-h-0 lg:overflow-y-auto lg:pr-1"
+          style={{ display: activeNavTab === 'scene_import' ? 'none' : undefined }}
+        >
+          {!indoorScene && <MapSelector
             anchor={anchor}
             setAnchor={setAnchor}
             tx={tx}
@@ -1203,15 +1526,22 @@ export default function App() {
             onResetProject={handleResetProject}
             isLoading={gisLoading}
             downloadProgress={downloadProgress}
-            trajectoryPoints={trajectoryPoints}
-          />
+            trajectoryPoints={activeTrajectoryPoints}
+          />}
 
-          <BaseStationImportPanel
+          {indoorScene ? (
+            <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4 text-sm">
+              <div className="font-semibold text-emerald-200">Indoor scene selected</div>
+              <div className="mt-1 text-xs text-[var(--text-mid)]">{indoorScene.archiveName} · {indoorScene.stats.shapeCount} objects · canonical scene-local metres, +Z up</div>
+              <div className="mt-2 text-xs text-amber-200">Indoor geometry and radio materials are active in Sionna RT. Place TX/RX for Link Analysis and the full TX×RX matrix. Mobility uses its waypoint path as the moving RX positions and does not require a separate RX placement.</div>
+              <button type="button" onClick={() => setActiveNavTab('scene_import')} className="mt-3 rounded-md border border-[var(--line)] px-3 py-1.5 text-xs hover:bg-[var(--ink-750)]">Manage imported scenes</button>
+            </div>
+          ) : <BaseStationImportPanel
             anchor={anchor}
             currentTxCount={txs.length}
             onImport={handleImportBaseStations}
             defaultArraySize={[1, 1]}
-          />
+          />}
 
           <SolverControls
             tx={tx}
@@ -1226,6 +1556,7 @@ export default function App() {
             setMaxDepth={setMaxDepth}
             solverOptions={solverOptions}
             setSolverOptions={setSolverOptions}
+            indoorMode={Boolean(indoorScene)}
           />
 
           {/* Keep mode panels mounted while hidden. Their local results, selected
@@ -1251,18 +1582,22 @@ export default function App() {
               onSelectPair={handleSelectPair}
               paths={paths}
               metrics={metrics}
+              solveInfo={solveInfo}
               onSolve={handleSolve}
               solving={solving}
               solveError={solveError}
               backendOnline={backendOnline}
+              indoorMode={Boolean(indoorScene)}
             />
           </div>
 
           <div className={activeMode === 'heatmap' ? 'contents' : 'hidden'}>
             <CoveragePanel
-              txCount={coverageBandFilter !== '__all__' ? coverageTxs.length : txs.length}
+              indoorMode={Boolean(indoorScene)}
+              indoorMaxHeight={indoorCoverageHeightMax}
+              txCount={indoorScene ? indoorCoverageTxs.length : (coverageBandFilter !== '__all__' ? coverageTxs.length : txs.length)}
               rx={rx}
-              bandOptions={coverageBandOptions}
+              bandOptions={indoorScene ? [] : coverageBandOptions}
               selectedBand={coverageBandFilter}
               onSelectBand={handleCoverageBandSelect}
               backendOnline={backendOnline}
@@ -1270,7 +1605,7 @@ export default function App() {
               heatmapLoading={loadingHeatmap}
               radioMap={radioMap}
               anchor={anchor}
-              txs={coverageTxs}
+              txs={indoorScene ? indoorCoverageTxs : coverageTxs}
               onFocusCell={setFocusedRadioMapCellIndex}
               focusedRadioMapCellIndex={focusedRadioMapCellIndex}
               coverageMetric={coverageMetric}
@@ -1281,12 +1616,12 @@ export default function App() {
               setCoverageBandwidthMhz={setCoverageBandwidthMhz}
               coverageNoiseFigureDb={coverageNoiseFigureDb}
               setCoverageNoiseFigureDb={setCoverageNoiseFigureDb}
-              coverageHeight={coverageHeight}
-              setCoverageHeight={setCoverageHeight}
-              coverageRes={coverageRes}
-              setCoverageRes={setCoverageRes}
-              samplesPerTx={coverageSamplesPerTx}
-              setSamplesPerTx={setCoverageSamplesPerTx}
+              coverageHeight={indoorScene ? Math.min(indoorCoverageHeight, indoorCoverageHeightMax) : coverageHeight}
+              setCoverageHeight={indoorScene ? setIndoorCoverageHeight : setCoverageHeight}
+              coverageRes={indoorScene ? indoorCoverageRes : coverageRes}
+              setCoverageRes={indoorScene ? setIndoorCoverageRes : setCoverageRes}
+              samplesPerTx={indoorScene ? indoorCoverageSamplesPerTx : coverageSamplesPerTx}
+              setSamplesPerTx={indoorScene ? setIndoorCoverageSamplesPerTx : setCoverageSamplesPerTx}
               radioMapSeed={radioMapSeed}
               setRadioMapSeed={setRadioMapSeed}
               showRaysOnHeatmap={showRaysOnHeatmap}
@@ -1313,8 +1648,8 @@ export default function App() {
               tx={tx}
               rx={rx}
               anchor={anchor}
-              trajectoryPoints={trajectoryPoints}
-              setTrajectoryPoints={setTrajectoryPoints}
+              trajectoryPoints={activeTrajectoryPoints}
+              setTrajectoryPoints={setActiveTrajectoryPoints}
               mobilitySteps={mobilitySteps}
               mobilityLoading={mobilityLoading}
               mobilityProgress={mobilityProgress}
@@ -1332,18 +1667,28 @@ export default function App() {
               mobilityHandover={mobilityHandover}
               solveError={solveError}
               backendOnline={backendOnline}
+              indoorMode={Boolean(indoorScene)}
+              indoorBounds={indoorScene?.canonicalBounds ?? null}
+              indoorReceiverHeight={indoorMobilityReceiverHeight}
+              onIndoorReceiverHeightChange={handleIndoorMobilityReceiverHeightChange}
               active={activeMode === 'playback'}
             />
           </div>
         </div>
 
         {/* Center/Right columns visualization viewport (8/12, 9/12 on wide screens) — content swaps with the top nav */}
-        <div className="flex flex-col gap-6 animate-rise lg:min-h-0 lg:overflow-y-auto lg:pr-1" style={{ animationDelay: '0.08s' }}>
+        <div
+          className={`flex flex-col gap-6 animate-rise lg:min-h-0 lg:overflow-y-auto lg:pr-1 ${activeNavTab === 'scene_import' ? 'lg:col-span-2' : ''}`}
+          style={{ animationDelay: '0.08s' }}
+        >
           {/* Main 3D WebGL Canvas */}
           {activeNavTab === '3d_scene' && (
             <ThreeStudio
               buildings={buildings}
               anchor={anchor}
+              indoorScene={indoorScene}
+              freqGhz={freqGhz}
+              solverOptions={solverOptions}
               tx={tx}
               rx={rx}
               txs={txs}
@@ -1361,20 +1706,27 @@ export default function App() {
               rmVmax={rmVmax}
               onTxUpdate={handleTxUpdate}
               onRxUpdate={handleRxUpdate}
+              onSelectTx={handleSelectTx}
+              onSelectRx={handleSelectRx}
               activeMode={activeMode}
               placementMode={placementMode}
               setPlacementMode={setPlacementMode}
               showOutlines={showOutlines}
               setShowOutlines={setShowOutlines}
               mobilityRxPosition={activeMobilityStep?.rxPosition ?? null}
-              trajectoryPoints={trajectoryPoints}
-              setTrajectoryPoints={setTrajectoryPoints}
+              indoorMobilityReceiverHeight={indoorMobilityReceiverHeight}
+              trajectoryPoints={activeTrajectoryPoints}
+              setTrajectoryPoints={setActiveTrajectoryPoints}
               measurementOverlayPoints={measurementOverlayPoints}
               measurementOverlayLabel={measurementOverlayLabel}
               measurementOverlayVisible={measurementOverlayVisible}
               setMeasurementOverlayVisible={setMeasurementOverlayVisible}
             />
           )}
+
+          <div className={activeNavTab === 'scene_import' ? 'contents' : 'hidden'}>
+            <SceneImportPanel onActiveSceneChange={handleActiveIndoorSceneChange} txs={txs} rxs={rxs} solverOptions={solverOptions} applicationFrequencyGhz={freqGhz} />
+          </div>
 
           {/* Keep workspaces alive across top-navigation changes. In particular,
               Field Validation must retain its selected identity audit when its
@@ -1441,7 +1793,7 @@ export default function App() {
           </div>
 
           {/* User tips documentation helper */}
-          <div className="panel p-4 text-[14px] flex gap-3.5 text-slate-300">
+          {activeNavTab !== 'scene_import' && <div className="panel p-4 text-[14px] flex gap-3.5 text-slate-300">
             <div className="grid place-items-center w-9 h-9 shrink-0 bg-[var(--ink-750)] border border-[var(--line)] text-[var(--accent)] rounded-lg h-fit">
               <BookOpen className="w-4 h-4" />
             </div>
@@ -1453,7 +1805,7 @@ export default function App() {
                 by dragging Leaflet markers, clicking <strong className="text-[var(--accent)] font-semibold">Place TX</strong> inside the 3D space, or editing the sliders.
               </p>
             </div>
-          </div>
+          </div>}
         </div>
       </main>
     </div>

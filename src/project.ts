@@ -18,7 +18,7 @@ import {
 export const PROJECT_SCHEMA_VERSION = 1;
 export const PROJECT_STORAGE_KEY = 'sionna-rt-studio.project.v1';
 
-export type StudioNavTab = '3d_scene' | 'geography' | 'analysis' | 'field_validation' | 'experiments' | 'export';
+export type StudioNavTab = '3d_scene' | 'scene_import' | 'geography' | 'analysis' | 'field_validation' | 'experiments' | 'export';
 export type StudioMode = 'link' | 'heatmap' | 'playback';
 
 export interface StudioProjectState {
@@ -132,7 +132,8 @@ const isTrajectoryPoint = (value: unknown): value is TrajectoryPoint =>
   isRecord(value) &&
   isFiniteNumber(value.lat) &&
   isFiniteNumber(value.lon) &&
-  isVector(value.enu);
+  isVector(value.enu) &&
+  (value.coordinateFrame === undefined || value.coordinateFrame === 'outdoor_enu' || value.coordinateFrame === 'indoor_scene_local');
 
 const isSolverOptions = (value: unknown): value is SolverOptions => {
   if (!isRecord(value)) return false;
@@ -212,7 +213,7 @@ const isProjectState = (value: unknown): value is StudioProjectState => {
     isFiniteNumber(mobility.handover.timeToTriggerMs) &&
     isFiniteNumber(mobility.speedKmh) &&
     isFiniteNumber(mobility.intervalMs) &&
-    ['3d_scene', 'geography', 'analysis', 'field_validation', 'experiments', 'export'].includes(String(display.activeNavTab)) &&
+    ['3d_scene', 'scene_import', 'geography', 'analysis', 'field_validation', 'experiments', 'export'].includes(String(display.activeNavTab)) &&
     ['link', 'heatmap', 'playback'].includes(String(display.activeMode)) &&
     typeof display.showOutlines === 'boolean' &&
     typeof display.showRaysOnHeatmap === 'boolean' &&

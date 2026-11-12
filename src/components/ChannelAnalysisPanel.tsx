@@ -22,6 +22,7 @@ interface ChannelAnalysisPanelProps {
   anchor: GeoAnchor;
   candidateScope: 'all' | 'rss_serving' | 'sinr_serving';
   selectionMode: 'strict_topk' | 'spatially_distributed';
+  indoorMode?: boolean;
   onFocusCell: (cellIndex: number) => void;
 }
 
@@ -47,7 +48,7 @@ function cfrPolyline(values: (number | null)[], width = 320, height = 92): strin
   }).join(' ');
 }
 
-export function ChannelAnalysisPanel({ radioMap, rx, anchor, candidateScope, selectionMode, onFocusCell }: ChannelAnalysisPanelProps) {
+export function ChannelAnalysisPanel({ radioMap, rx, anchor, candidateScope, selectionMode, indoorMode = false, onFocusCell }: ChannelAnalysisPanelProps) {
   const [criterion, setCriterion] = useState<SampleCriterion>('weak_sinr');
   const [sectorIndex, setSectorIndex] = useState(0);
   const [txMode, setTxMode] = useState<TxMode>('serving_and_interferer');
@@ -129,7 +130,8 @@ export function ChannelAnalysisPanel({ radioMap, rx, anchor, candidateScope, sel
     const requestBody = { cellIndices: selectedCells, txMode, txIndex: sectorIndex, rxArraySize: rx.antennaArraySize, numSubcarriers, subcarrierSpacingHz: 30_000, pathsToReturn: 24 };
     const configuration = {
       radioMap: { mapId: radioMap.mapId, cellCount: radioMap.cells.length, metric: radioMap.metric, geoReference: radioMap.geoReference },
-      receiver: rx, anchor, candidateScope, selectionMode,
+      receiver: rx, anchor: indoorMode ? undefined : anchor, candidateScope, selectionMode,
+      coordinateFrame: indoorMode ? 'canonical_scene_local' : 'ENU',
       request: requestBody,
     };
     setRunning(true);
@@ -176,8 +178,12 @@ export function ChannelAnalysisPanel({ radioMap, rx, anchor, candidateScope, sel
     return `https://www.google.com/maps/search/?api=1&query=${geo.lat.toFixed(7)},${geo.lon.toFixed(7)}`;
   };
   const copyCoordinates = async (x: number, y: number, z: number) => {
-    const geo = getGeolocation(x, y, z);
-    const value = `${geo.lat.toFixed(7)}, ${geo.lon.toFixed(7)}`;
+    const value = indoorMode
+      ? `scene-local XYZ: ${x.toFixed(3)}, ${y.toFixed(3)}, ${z.toFixed(3)} m`
+      : (() => {
+        const geo = getGeolocation(x, y, z);
+        return `${geo.lat.toFixed(7)}, ${geo.lon.toFixed(7)}`;
+      })();
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(value);
@@ -245,7 +251,7 @@ export function ChannelAnalysisPanel({ radioMap, rx, anchor, candidateScope, sel
       </div>
       <p className="text-[9px] text-slate-500">{txModeDescription[txMode]} The same carrier, scene geometry, transmitter configuration, materials and interaction switches used for the cached map are replayed by the backend.</p>
       <p className="text-[9px] text-slate-500">Candidate scope: <b>{candidateScope === 'all' ? 'all map cells' : candidateScope === 'rss_serving' ? 'RSS-serving footprint of selected sector' : 'best-SINR footprint of selected sector'}</b> · Ranking: <b>{selectionMode === 'strict_topk' ? 'strict Top-K' : 'spatially distributed sample'}</b>. Choose “Selected sector only” above when you want the chosen candidate sector itself traced even if it is not the RSS-serving sector.</p>
-      {!radioMap.geoReference && <p className="rounded border border-amber-200 bg-amber-50 p-2 text-[9px] text-amber-900">No georeference snapshot was stored with this map. Google Maps coordinates use the current scene anchor; verify that the anchor matches the map's actual WGS84 origin.</p>}
+      {!indoorMode && !radioMap.geoReference && <p className="rounded border border-amber-200 bg-amber-50 p-2 text-[9px] text-amber-900">No georeference snapshot was stored with this map. Google Maps coordinates use the current scene anchor; verify that the anchor matches the map's actual WGS84 origin.</p>}
 
       <div className="flex flex-wrap items-end gap-2">
         <button type="button" onClick={() => void loadCandidates()} disabled={!radioMap.mapId || loadingCandidates || running} className="inline-flex items-center gap-1.5 rounded border border-[#b9c8c8] bg-white px-3 py-2 text-[10px] font-bold text-slate-700 disabled:opacity-40">
@@ -276,18 +282,18 @@ export function ChannelAnalysisPanel({ radioMap, rx, anchor, candidateScope, sel
           </div>
           <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
             {candidates.map((cell) => {
-              const geo = getGeolocation(cell.x, cell.y, cell.z);
+              const geo = indoorMode ? null : getGeolocation(cell.x, cell.y, cell.z);
               return (
                 <div key={cell.cellIndex} className={`flex flex-col gap-1.5 rounded border p-2 ${selectedCells.includes(cell.cellIndex) ? 'border-[#a7b9b4] bg-[#eef3f0]' : 'border-[#eeeae2] bg-[#fbfaf7]'}`}>
                   <div className="flex items-center gap-2">
                     <input aria-label={`Select cell ${cell.cellIndex}`} type="checkbox" checked={selectedCells.includes(cell.cellIndex)} onChange={() => toggleCell(cell.cellIndex)} disabled={!selectedCells.includes(cell.cellIndex) && selectedCells.length >= MAX_SELECTED_CELLS} className="accent-[#4a727e]" />
                     <span className="min-w-0 flex-1"><b className="font-mono text-slate-800">Cell #{cell.cellIndex}</b><span className="ml-1 font-mono text-slate-500">{fmt(cell.sinrDb, 1, ' dB')} SINR</span></span>
                   </div>
-                  <div className="pl-5 font-mono text-[8px] text-slate-500">ENU {cell.x.toFixed(2)}, {cell.y.toFixed(2)}, {cell.z.toFixed(2)} m</div>
-                  <div className="pl-5 font-mono text-[8px] font-semibold text-slate-700">{geo.lat.toFixed(7)}, {geo.lon.toFixed(7)}</div>
+                  <div className="pl-5 font-mono text-[8px] text-slate-500">{indoorMode ? 'Scene-local XYZ' : 'ENU'} {cell.x.toFixed(2)}, {cell.y.toFixed(2)}, {cell.z.toFixed(2)} m</div>
+                  {!indoorMode && geo && <div className="pl-5 font-mono text-[8px] font-semibold text-slate-700">{geo.lat.toFixed(7)}, {geo.lon.toFixed(7)}</div>}
                   <div className="flex flex-wrap gap-1 pl-5">
                     <button type="button" onClick={() => onFocusCell(cell.cellIndex)} className="inline-flex items-center gap-1 rounded border border-[#d8d4c8] bg-white px-2 py-1 text-[8px] font-semibold text-slate-700"><MapPin className="h-3 w-3" /> Mark in 3D</button>
-                    <button type="button" onClick={() => openGoogleMaps(cell.x, cell.y, cell.z)} className="inline-flex items-center gap-1 rounded border border-[#d8d4c8] bg-white px-2 py-1 text-[8px] font-semibold text-slate-700"><ExternalLink className="h-3 w-3" /> Google Maps</button>
+                    {!indoorMode && <button type="button" onClick={() => openGoogleMaps(cell.x, cell.y, cell.z)} className="inline-flex items-center gap-1 rounded border border-[#d8d4c8] bg-white px-2 py-1 text-[8px] font-semibold text-slate-700"><ExternalLink className="h-3 w-3" /> Google Maps</button>}
                     <button type="button" onClick={() => void copyCoordinates(cell.x, cell.y, cell.z)} className="inline-flex items-center gap-1 rounded border border-[#d8d4c8] bg-white px-2 py-1 text-[8px] font-semibold text-slate-700"><Copy className="h-3 w-3" /> Copy</button>
                   </div>
                 </div>
@@ -322,25 +328,24 @@ export function ChannelAnalysisPanel({ radioMap, rx, anchor, candidateScope, sel
           </div>
           <p className="text-[9px] text-slate-500">{result.frequencyGhz.toFixed(4)} GHz · max depth {result.maxDepth} · {result.numSubcarriers} CFR subcarriers · {result.execution.samplesPerSource.toLocaleString()} samples/source · {result.execution.estimatedCfrComplexSamples.toLocaleString()} CFR elements · seed {result.execution.seed}</p>
 
-          {result.locations.map((location) => (
+          {result.locations.map((location) => {
+            const position = indoorMode ? location.positionSceneLocalM : location.positionEnuM;
+            if (!position) return null;
+            const geo = indoorMode ? null : getGeolocation(position.x, position.y, position.z);
+            return (
             <article key={location.cellIndex} className="flex flex-col gap-2 rounded border border-[#d8d4c8] bg-white p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="text-[11px] font-bold text-slate-800">Map cell #{location.cellIndex}</div>
-                <span className="font-mono text-[9px] text-slate-500">ENU ({location.positionEnuM.x.toFixed(2)}, {location.positionEnuM.y.toFixed(2)}, {location.positionEnuM.z.toFixed(2)}) m</span>
+                <span className="font-mono text-[9px] text-slate-500">{indoorMode ? 'Scene-local XYZ' : 'ENU'} ({position.x.toFixed(2)}, {position.y.toFixed(2)}, {position.z.toFixed(2)}) m</span>
               </div>
-              {(() => {
-                const geo = getGeolocation(location.positionEnuM.x, location.positionEnuM.y, location.positionEnuM.z);
-                return (
-                  <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-sky-100 bg-sky-50 p-2">
-                    <div className="font-mono text-[9px] font-semibold text-sky-900">WGS84 {geo.lat.toFixed(7)}, {geo.lon.toFixed(7)}</div>
-                    <div className="flex gap-1">
-                      <button type="button" onClick={() => onFocusCell(location.cellIndex)} className="rounded border border-sky-200 bg-white px-2 py-1 text-[8px] font-semibold text-sky-900">Mark in 3D</button>
-                      <button type="button" onClick={() => openGoogleMaps(location.positionEnuM.x, location.positionEnuM.y, location.positionEnuM.z)} className="rounded border border-sky-200 bg-white px-2 py-1 text-[8px] font-semibold text-sky-900">Google Maps</button>
-                      <button type="button" onClick={() => void copyCoordinates(location.positionEnuM.x, location.positionEnuM.y, location.positionEnuM.z)} className="rounded border border-sky-200 bg-white px-2 py-1 text-[8px] font-semibold text-sky-900">Copy</button>
-                    </div>
-                  </div>
-                );
-              })()}
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-sky-100 bg-sky-50 p-2">
+                <div className="font-mono text-[9px] font-semibold text-sky-900">{indoorMode ? 'Canonical scene-local XYZ' : `WGS84 ${geo?.lat.toFixed(7)}, ${geo?.lon.toFixed(7)}`}</div>
+                <div className="flex gap-1">
+                  <button type="button" onClick={() => onFocusCell(location.cellIndex)} className="rounded border border-sky-200 bg-white px-2 py-1 text-[8px] font-semibold text-sky-900">Mark in 3D</button>
+                  {!indoorMode && <button type="button" onClick={() => openGoogleMaps(position.x, position.y, position.z)} className="rounded border border-sky-200 bg-white px-2 py-1 text-[8px] font-semibold text-sky-900">Google Maps</button>}
+                  <button type="button" onClick={() => void copyCoordinates(position.x, position.y, position.z)} className="rounded border border-sky-200 bg-white px-2 py-1 text-[8px] font-semibold text-sky-900">Copy</button>
+                </div>
+              </div>
               <div className="text-[9px] text-slate-500">Radio-map serving sector: {location.radioMap.servingTxName ?? 'none'} · RSS {fmt(location.radioMap.rssDbm, 1, ' dBm')} · top interferer index {location.radioMap.topInterfererTxIndex ?? '—'}</div>
               {location.links.map((link) => {
                 const tapPoints = link.cirTaps.filter((tap) => tap.receivedPowerDbm != null);
@@ -390,7 +395,8 @@ export function ChannelAnalysisPanel({ radioMap, rx, anchor, candidateScope, sel
               })}
               {location.links.length === 0 && <p className="text-[9px] text-amber-700">No associated TX was selected for this location.</p>}
             </article>
-          ))}
+            );
+          })}
           <p className="text-[9px] leading-relaxed text-slate-500">{result.interpretation.los} {result.interpretation.kFactor} {result.interpretation.cfr}</p>
         </div>
       )}

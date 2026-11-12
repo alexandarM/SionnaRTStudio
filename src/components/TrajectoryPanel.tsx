@@ -42,6 +42,10 @@ interface TrajectoryPanelProps {
   mobilityHandover: HandoverAnalysis | null;
   solveError: string;
   backendOnline: boolean;
+  indoorMode?: boolean;
+  indoorBounds?: { minimum: number[]; maximum: number[] } | null;
+  indoorReceiverHeight?: number;
+  onIndoorReceiverHeightChange?: (value: number) => void;
   /** Whether this preserved panel is currently visible. Playback pauses when hidden. */
   active: boolean;
 }
@@ -79,8 +83,15 @@ export function TrajectoryPanel({
   mobilityHandover,
   solveError,
   backendOnline,
+  indoorMode = false,
+  indoorBounds = null,
+  indoorReceiverHeight = 1.0,
+  onIndoorReceiverHeightChange,
   active,
 }: TrajectoryPanelProps) {
+  const indoorReceiverHeightMax = indoorBounds
+    ? Math.max(0.2, Math.min(3.0, Number(indoorBounds.maximum[2]) - Number(indoorBounds.minimum[2]) - 0.1))
+    : 3.0;
   const [isSimulatingMobility, setIsSimulatingMobility] = useState(false);
   const [mobilityStep, setMobilityStep] = useState(0);
   const playbackTimerRef = useRef<number | null>(null);
@@ -132,17 +143,44 @@ export function TrajectoryPanel({
   const generateCircularTrajectory = () => {
     const pts: TrajectoryPoint[] = [];
     const steps = 12;
-    const radius = 120; // meters
 
-    for (let i = 0; i < steps; i++) {
-      const angle = (i / steps) * Math.PI * 2;
-      const enu = {
-        x: tx.enu.x + radius * Math.cos(angle),
-        y: tx.enu.y + radius * Math.sin(angle),
-        z: rx.height,
-      };
-      const ll = enuToLatLon(enu, anchor);
-      pts.push({ lat: ll.lat, lon: ll.lon, enu });
+    if (indoorMode) {
+      // Never fall back to a 120 m outdoor ENU loop when the indoor scene
+      // does not expose usable bounds. The loop must stay in scene-local metres.
+      if (!indoorBounds || indoorBounds.minimum.length < 3 || indoorBounds.maximum.length < 3) return;
+      const [minX, minY, minZ] = indoorBounds.minimum.map(Number);
+      const [maxX, maxY, maxZ] = indoorBounds.maximum.map(Number);
+      if (![minX, minY, minZ, maxX, maxY, maxZ].every(Number.isFinite)) return;
+      const width = Math.max(0, maxX - minX);
+      const depth = Math.max(0, maxY - minY);
+      const height = Math.max(0, maxZ - minZ);
+      const radius = Math.min(width, depth) * 0.22;
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      const receiverHeight = Math.min(Math.max(indoorReceiverHeight, 0.1), Math.max(0.1, height - 0.1));
+      const z = Math.min(maxZ - 0.05, minZ + receiverHeight);
+      if (radius < 0.05 || !Number.isFinite(z) || maxZ <= minZ) return;
+      for (let i = 0; i < steps; i++) {
+        const angle = (i / steps) * Math.PI * 2;
+        const enu = {
+          x: centerX + radius * Math.cos(angle),
+          y: centerY + radius * Math.sin(angle),
+          z,
+        };
+        pts.push({ lat: 0, lon: 0, enu, coordinateFrame: 'indoor_scene_local' });
+      }
+    } else {
+      const radius = 120; // outdoor loop radius in metres
+      for (let i = 0; i < steps; i++) {
+        const angle = (i / steps) * Math.PI * 2;
+        const enu = {
+          x: tx.enu.x + radius * Math.cos(angle),
+          y: tx.enu.y + radius * Math.sin(angle),
+          z: rx.height,
+        };
+        const ll = enuToLatLon(enu, anchor);
+        pts.push({ lat: ll.lat, lon: ll.lon, enu, coordinateFrame: 'outdoor_enu' });
+      }
     }
     stopMobilityPlayback();
     playbackStepRef.current = 0;
@@ -166,7 +204,7 @@ export function TrajectoryPanel({
       // the Rx device) keeps App's stale-state cleanup from resetting playback.
       onMobilityStepSelectRef.current({
         index,
-        rxPosition: { x: pt.enu.x, y: pt.enu.y, z: rxRef.current.height },
+        rxPosition: { x: pt.enu.x, y: pt.enu.y, z: pt.coordinateFrame === 'indoor_scene_local' ? pt.enu.z : rxRef.current.height },
         receivedPowerDbm: -200,
         rmsDelaySpreadNs: 0,
         rmsDelaySpreadValid: true,
@@ -211,14 +249,48 @@ export function TrajectoryPanel({
           (best-server) → the active RX walks the drawn path. + Add a TX here. */}
       <div className="flex flex-col gap-2 bg-[#f5f3ec] border border-[#e3e0d6] rounded p-2.5">
         <span className="text-[11px] text-slate-600 font-bold">
-          Transmitters ray-traced to the path{txs.length > 1 ? ' · best-server' : ''}
+          {indoorMode ? 'Indoor transmitter inventory' : `Transmitters ray-traced to the path${txs.length > 1 ? ' · best-server' : ''}`}
         </span>
         <DeviceRow label="TX" list={txs} activeId={activeTxId} onSelect={onSelectTx} onRemove={onRemoveTx} onAdd={onAddTx} dotClass="bg-[#cc785c]" />
         <span className="text-[11px] text-slate-500 leading-snug">
-          Each transmitter above is ray-traced to every waypoint; <strong className="text-slate-700">{rx.name}</strong> walks the path.
+          {indoorMode
+            ? 'Add/select indoor transmitters here; each new device can be positioned with Place TX in the 3D viewport.'
+            : <>Each transmitter above is ray-traced to every waypoint; <strong className="text-slate-700">{rx.name}</strong> walks the path.</>}
         </span>
       </div>
 
+      {indoorMode && (
+        <>
+          <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-relaxed text-sky-800">
+            Indoor path coordinates use the active room's canonical scene-local frame (metres). Each waypoint is an RX position; no separate RX marker needs to be placed. The same mobility solver, playback, per-TX metrics and A3 analysis are used as outdoors.
+          </div>
+          <div className="flex flex-col gap-2 bg-[#f5f3ec] border border-[#e3e0d6] rounded p-2.5">
+            <div className="flex justify-between items-center">
+              <span className="text-[11px] font-bold text-slate-600">RX height above floor</span>
+              <span className="text-[12px] font-bold text-slate-700 font-mono">{indoorReceiverHeight.toFixed(2)} m</span>
+            </div>
+            <input
+              id="slider-indoor-rx-height"
+              type="range"
+              min="0.2"
+              max={indoorReceiverHeightMax}
+              step="0.05"
+              className="accent-[#cc785c]"
+              value={Math.min(indoorReceiverHeight, indoorReceiverHeightMax)}
+              onChange={(event) => {
+                stopMobilityPlayback();
+                playbackStepRef.current = 0;
+                setMobilityStep(0);
+                onIndoorReceiverHeightChange?.(Number(event.target.value));
+              }}
+            />
+            <div className="flex justify-between text-[10px] text-slate-500">
+              <span>0.20 m</span>
+              <span>Maximum room clearance · {indoorReceiverHeightMax.toFixed(2)} m</span>
+            </div>
+          </div>
+        </>
+      )}
       {/* Multi-Tx KPI aggregation toggle — applied on the next Run Mobility.
           Rays drawn are the union of all Tx in both modes; only the per-step
           scalar KPIs differ (strongest Tx vs total power over all Tx). */}
@@ -285,14 +357,14 @@ export function TrajectoryPanel({
       {trajectoryPoints.length === 0 ? (
         <div className="flex flex-col items-center gap-3 py-4 text-center">
           <p className="text-[14px] text-slate-600 font-medium max-w-xs">
-            Draw a receiver path in the 3D scene, or generate a quick loop around the transmitter.
+            Draw a receiver path in the 3D scene, or generate a quick loop inside the active room.
           </p>
           <button
             id="btn-gen-trajectory"
             onClick={generateCircularTrajectory}
             className="btn-signal py-2 px-4 rounded text-[14px] font-semibold cursor-pointer"
           >
-            Generate Loop Path
+            Generate Room Loop
           </button>
         </div>
       ) : (
@@ -418,12 +490,12 @@ export function TrajectoryPanel({
               </div>
               <input
                 type="range"
-                min="10"
+                min="0.1"
                 max="120"
-                step="5"
+                step="0.1"
                 className="accent-[#cc785c]"
                 value={mobilitySpeedKmh}
-                onChange={(e) => setMobilitySpeedKmh(parseInt(e.target.value, 10))}
+                onChange={(e) => setMobilitySpeedKmh(Number(e.target.value))}
               />
               <div className="flex justify-between items-center">
                 <span className="text-[11px] font-bold text-slate-600">RT Sample Interval</span>

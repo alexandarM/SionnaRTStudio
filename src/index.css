@@ -177,6 +177,23 @@ html, body {
   border-radius: 10px;
 }
 
+/* Consistent controls for the standalone Mitsuba scene importer. */
+.scene-import-field {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--ink-750);
+  color: var(--text-hi);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.scene-import-field:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+
 /* Hairline rule under a panel heading. */
 .rule {
   border: 0;

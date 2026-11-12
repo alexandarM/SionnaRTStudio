@@ -23,3 +23,6 @@ pydantic>=2.6
 
 # EPSG:4326 -> EPSG:32634 metric coordinate audit/export.
 pyproj>=3.6,<4
+
+# Mitsuba XML bitmap textures in scene-import previews.
+Pillow>=9.0

@@ -1,6 +1,6 @@
 {
   "x-fork-modification-notice": "Modified in the alexandarM/SionnaRTStudio fork of puloktarafder/SionnaRTStudio.",
-"name": "sionna-rt-studio",
+  "name": "sionna-rt-studio",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -19,7 +19,20 @@
     "check:georeference": "node --import tsx scripts/check-georeference.ts",
     "check:link-matrix-persistence": "node --import tsx scripts/check-link-matrix-persistence.ts",
     "check:measurement-overlay": "node --import tsx scripts/check-measurement-overlay.ts",
-    "check:panel-lifecycle": "node scripts/check-panel-lifecycle.mjs"
+    "check:panel-lifecycle": "node scripts/check-panel-lifecycle.mjs",
+    "check:scene-coordinates": "node --import tsx scripts/check-scene-coordinates.ts",
+    "check:scene-import": "node scripts/check-scene-import-contract.mjs",
+    "check:scene-manager": "node scripts/check-scene-manager-contract.mjs",
+    "check:indoor-placement": "node --import tsx scripts/check-indoor-device-placement.ts && node scripts/check-indoor-placement-contract.mjs",
+    "check:antenna-rf": "node --import tsx scripts/check-antenna-rf.ts && node scripts/check-antenna-rf-contract.mjs",
+    "check:indoor-activation": "node scripts/check-indoor-activation-contract.mjs",
+    "check:indoor-device-sync": "node scripts/check-indoor-device-sync-contract.mjs",
+    "check:indoor-path-solver": "node scripts/check-indoor-path-solver-contract.mjs",
+    "check:path-renderer": "node scripts/check-path-renderer-contract.mjs",
+    "check:indoor-link-matrix": "node scripts/check-indoor-link-matrix-contract.mjs",
+    "check:indoor-radiomap": "node scripts/check-indoor-radiomap-contract.mjs",
+    "check:indoor-channel-analysis": "node scripts/check-indoor-channel-analysis-contract.mjs",
+    "check:indoor-mobility": "node scripts/check-indoor-mobility-contract.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",
