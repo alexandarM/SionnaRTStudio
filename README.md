@@ -37,10 +37,10 @@ coverage maps, multi-transmitter receiver mobility with 3GPP A3 handover analysi
 Shannon-capacity link KPIs, an optional 5G NR PUSCH BER/BLER chain, and
 CIR/CFR analysis and exports.
 
-> **Google Colab support:** use the included [ZIP-only Colab Launcher notebook](SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb), or open it directly in Colab with the badge below.
-> Upload one complete SionnaRTStudio source ZIP. The notebook does not clone GitHub or pull source code; it installs the uploaded archive, discovers all `check:*` project checks, runs backend/frontend validation and starts the app through the Colab port proxy.
+> **Google Colab support:** use the included [Colab Launcher notebook](SionnaRTStudio_Colab_Launcher.ipynb), or open it directly in Colab with the badge below.
+> The launcher clones the configured fork, installs the project dependencies, checks the backend/frontend health endpoints, opens the Colab port proxy, and can store the experiment database on Google Drive.
 >
-> [![Open in Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/alexandarM/SionnaRTStudio/blob/main/SionnaRTStudio_Colab_Launcher_ZIP_ONLY.ipynb)
+> [![Open in Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/alexandarM/SionnaRTStudio/blob/main/SionnaRTStudio_Colab_Launcher.ipynb)
 >
 > **New to SionnaRTStudio?** Follow the
 > **[upstream step-by-step tutorial by Pulok Tarafder](https://puloktarafder.github.io/posts/2026/08/sionnartstudio-tutorial/)**
